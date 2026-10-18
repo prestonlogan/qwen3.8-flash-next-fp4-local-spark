@@ -1,0 +1,1 @@
+{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","adaptive_speculative_tokens_window":8,"adaptive_speculative_tokens_initial":2,"num_speculative_tokens_per_batch_size":[[1,8,3]]}

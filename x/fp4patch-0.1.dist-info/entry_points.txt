@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+fp4x = fp4patch:register

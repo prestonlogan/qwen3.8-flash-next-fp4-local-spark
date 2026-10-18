@@ -1,0 +1,1 @@
+-v @ROOT@/x/fp4patch.py:/usr/local/lib/python3.12/dist-packages/fp4patch.py:ro -v @ROOT@/x/fp4x_kernels.py:/usr/local/lib/python3.12/dist-packages/fp4x_kernels.py:ro -v @ROOT@/x/fp4patch-0.1.dist-info:/usr/local/lib/python3.12/dist-packages/fp4patch-0.1.dist-info:ro -v @ROOT@/x/fp4ext.py:/usr/local/lib/python3.12/dist-packages/fp4ext.py:ro -v @ROOT@/x:/x -e VLLM_SERVER_DEV_MODE=1
