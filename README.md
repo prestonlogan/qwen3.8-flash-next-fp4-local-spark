@@ -72,7 +72,8 @@ Where the time goes now, per 38.8 ms step (CUDA-event spans and graph-timed comp
 | Part | ms | Floor at 243 GB/s |
 |---|---|---|
 | Verify graph | ~34 | |
-| ‣ routed + shared MoE (b12x W4A16, ~21 unique experts per 3-token step) | ~15 | ~12.4 |
+| ‣ routed MoE GEMMs (b12x W4A16, ~23 unique experts per 3-token step) | ~12.1 | ~12.4 |
+| ‣ rest of the MoE block: router, CSF scale expansion (1.35), route packing, shared expert on the aux stream | ~4.2 | |
 | ‣ dense linears (W6 / NVFP4 Triton GEMVs, 240 calls) | ~10.5 | 8.3 |
 | ‣ hyper-connection mixers (97 × 2 fused kernels) | ~3.4 | 2.7 |
 | ‣ router gates (W8) | ~0.45 | 0.26 |
@@ -125,6 +126,11 @@ Greedy prose2 tok/s, ms/step, and tokens per step. Raw JSONL is in `results/`.
 | **E31** | **E27 + fast head at BK 512 + fused refine (shipped)** | **55.0** | **39.0** | 2.14 | 72.9 |
 | **E32** | **E31 + INT2 draft head, top-64 refine (shipped)** | **55.2** | **38.8** | 2.14 | 70.9 |
 | SHIP3 | shipped `serve.sh` defaults | 55.6 | 38.8 | 2.16 | 73.3 |
+| E33 | SHIP3 with 3 drafts | 53.9 | 44.5 | 2.40 | 78.5 |
+| E35 | SHIP3 + NVFP4 expert scales pre-expanded at load (exact) | 55.1 | 39.3 | 2.17 | 71.4 |
+| E36 | SHIP3 + shared-expert tail fused into one kernel (exact) | 54.8 | 39.0 | 2.13 | 71.7 |
+| E37 | SHIP3 config, same-session baseline for E35/E36 | 55.6 | 38.8 | 2.16 | 72.0 |
+| E34 | draft logits / T for sampled drafts (T 1.0 / 0.85 / 0.7, runtime-tuned, n=24 each) | sampled 53.9 / 54.5 / 53.7 | | | |
 
 Sampled prose: E15 47.4, E18 50.8, E20b 48.6, **E21 50.9**, E22 48.8, E24 50.7, E25 50.5, E26 50.8, **E27 51.3**, SHIP2 51.3, E31 52.4, **E32 54.4** (sampled tok/step 2.07 → 2.14), SHIP3 53.4.
 
@@ -179,12 +185,19 @@ The FP4-Local MTP drafter, LM head and embeddings are **bit-identical** to the p
 - **Programmatic dependent launch** for the plugin's GEMVs (E25). A chain of PDL GEMVs saves about 2 µs per kernel in isolation, but in the model most neighbours are b12x/torch kernels that never trigger early, so step time didn't move.
 - **W6 hyper-connection mixers.** The mixer GEMVs (336×10240, 10240×320) are latency-bound at 17–21 µs; 6-bit weights were no faster than int8 and have 3× the error.
 - **Semaphore split-K for the W6 dense GEMVs.** No gain for any dense shape (out_proj stays near 190 GB/s); split-K only pays off for the 11-tile mixer down projection.
-- **b12x small-M MoE knobs** (`B12X_W4A16_SMALL_M_OCCUPANCY=2`, `B12X_W4A16_SMALL_M_SPLITK=1`): within ±2% on the 48-layer MoE graph. On real routing b12x already reaches ~85–90% of bandwidth, which caps a custom W4A16 decode kernel at roughly 1–1.5 ms.
+- **b12x small-M MoE knobs** (`B12X_W4A16_SMALL_M_OCCUPANCY=2`, `B12X_W4A16_SMALL_M_SPLITK=1`): within ±2% on the 48-layer MoE graph.
+- **A custom NVFP4 MoE decode kernel** (`x/fp4x_moe.py`, Triton, reads b12x's packed weights and scales in place). It matches b12x to 6e-4 relative, but on real 3-row routing it takes 18.3 ms for the 48 MoE blocks against b12x's 16.3. Skipping the routed GEMMs shows why: they cost 12.1 ms, which is the bandwidth floor for the ~23 unique experts per layer (12.4 ms at 243 GB/s). b12x's routed kernels have no headroom left. The rest of the block (4.2 ms) is the router, shared expert, scale expansion, and route packing.
+- **Pre-expanding the NVFP4-CSF expert scales at load** (E35). b12x stores expert scales compressed (CSF, 3.97 GB) and expands the routed experts' scales into a shared scratch on every call; that kernel takes 1.35 ms/step at 3 rows. Expanding all 48 layers once at load (+7.55 GB) is bit-exact (PPL unchanged) but no faster: 55.1 tok/s at 39.3 ms/step. The expanded scales are 7 MB per layer per step read from DRAM, where CSF reads half that and its output is still in L2 when the GEMM reads it. Two traps if you retry it: the W4A16 kernels read `representation.value.w13_scale`, not `_impl.w1_blockscale`, and setting `nvfp4_csf=None` changes b12x's tuning plan and fails preparation.
+- **Fusing the shared expert's tail** (E36). One kernel for silu-and-mul, the W6 down projection and the sigmoid gate, replacing five launches (act_and_mul, GEMV, cuBLAS dot + reduce, sigmoid, mul). It is bit-exact and saves 0.37 ms on the 48 graph-timed MoE blocks, but the full step was 39.0 ms against 38.8 for the same-session baseline. The shared expert runs on vLLM's aux stream, so it is off the critical path.
+- **Draft temperature for sampled drafts** (E34, `FP4X_DRAFT_TSCALE`): 0.85 gave +0.6 tok/s sampled, inside the noise; not shipped.
+- **3 drafts after the head kernels** (E33): prose 53.9 at 44.5 ms/step, but code/JSON reach 78.5/77.8. Use `FP4_SPEC` with 3 drafts for code-heavy work.
+- **Hiding the PLE disk read behind layer 0.** The read takes 0.285 ms for 48 rows once the token ids are known. The CPU spends the rest of the wait blocked on the previous step, so hiding it is worth at most ~0.35 ms and needs an AOT-cache bust; deprioritized.
 - **HC W8 on the MTP mixers** (E24), also with the fused kernels (E30): neutral.
 - **Turning off vLLM's stream overlap.** Running the shared expert on the main stream (E28) costs 1.2 ms/step, and serializing GDN's two input projections (E29) costs 0.9 ms/step. The small decode kernels leave enough of the GPU idle that a second stream fills it, so the defaults stay.
 - **e4m3 group scales for the INT2 head.** 16% fewer bytes, but no faster at M=3 (the dequant becomes the limit).
 - **1-bit (sign × per-16 mean) coarse head.** On 1,200 real decode rows the true argmax ranked as low as 487 and the top-20 often fell outside the top 1024, against a worst rank of 17 for INT2.
 - **Fast-head candidate recall, for the record.** On 1,200–1,500 real decode rows the true argmax was always within the INT2 top 30. The true top 20 was inside the top 512 for all but one row, where one top-20 logit stays a coarse estimate. Greedy output is unaffected; that row's top-k-20 sampling distribution is very slightly off.
+- **Disabling kernel nodes in the captured graph to cost them** (`FP4X_KEEP_GRAPH=1` + `x/probes/probe_ablate.py`). Without a profiler this looked like a way to price each kernel class. It isn't reliable: garbage activations change the MoE routing and with it the MoE cost (one run dropped from 33.9 to 19 ms), and disabling index-producing kernels faults the GPU. Only the big GEMV classes gave usable numbers: W6 5.3 ms (204 calls), qkvz NV4 3.3 ms (36), HC mixers 2.7 ms (194).
 - **Torch profiler.** One profiler run was followed by a hard reset of the Spark on the next reload. Use CUDA-event spans instead (`x/probes/probe16*.py`).
 
 ## Layout

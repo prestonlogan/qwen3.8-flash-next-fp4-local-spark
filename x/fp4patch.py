@@ -20,6 +20,8 @@ CFG_BG = {(336, 10240): (16, 512, 1, 4), (10240, 320): (32, 64, 1, 4), (512, 256
 CFG_HC_NV4 = {(336, 10240): (16, 128, 2, 20), (10240, 320): (32, 64, 4, 1)}
 CFG_W8 = {(336, 10240): (32, 512, 4, 4), (10240, 320): (32, 64, 1, 8), (512, 2560): (16, 512, 1, 4)}
 _stats = {"mx8": 0, "mx8_skip": 0}
+_DRAFT_INV_T = {}
+_LOWBIT_FOR = None  # set by _patch_mx8: B12xBlockscaledLinear -> its low-bit decode copy (or None)
 
 
 def _log(msg):
@@ -58,6 +60,18 @@ def _patch_mx8():
             if len(cache) in (1, 200): _log(f"dense {dense_mode}: quantized {len(cache)} layers")
         return q
 
+    def lowbit_for(lin):
+        pk = lin.packed
+        w = pk.weight.values
+        if w.dtype == torch.uint8:
+            w = w.view(torch.float8_e4m3fn)
+        if lin.recipe != "mxfp8" or pk.padded_in_features != pk.in_features or w.dim() != 2 or mode_for(*w.shape) != "w6":
+            return None
+        return lowbit(lin, w, pk.weight.scale_rows.view(torch.uint8).view(w.shape[0], -1))
+
+    global _LOWBIT_FOR
+    if dense_mode == "w6":
+        _LOWBIT_FOR = lowbit_for
     seen = set()
 
     def run(self, source, bias):
@@ -230,6 +244,7 @@ def _patch_draft_vocab():
     path = os.environ["FP4X_DRAFT_VOCAB"]
     cfg = tuple(int(v) for v in os.environ.get("FP4X_DRAFT_CFG", "32,256,4").split(","))
     dc = int(os.environ.get("FP4X_DRAFT_INT2", "0"))  # >0: INT2 coarse + exact refine of the top dc rows
+    dts = float(os.environ.get("FP4X_DRAFT_TSCALE", "1.0"))  # draft logits / dts (sampled drafts only differ)
     orig = MTP.Qwen4ExpMTP.compute_logits
 
     def build(self, dev):
@@ -261,6 +276,12 @@ def _patch_draft_vocab():
             co = F.int2_logits(h, *self._fx_c, self._fx_idx.numel())
             cand = torch.topk(co, dc, dim=-1).indices
             vals = F.refine_nv4(h, cand, self._fx_w, self._fx_s, self._fx_gs)
+            if dts != 1.0:
+                # Sharper draft q at any temperature (argmax unchanged). A device scalar so probes can retune it
+                # under CUDA graphs (fp4patch._DRAFT_INV_T).
+                if _DRAFT_INV_T.get(h.device) is None:
+                    _DRAFT_INV_T[h.device] = torch.full((1,), 1.0 / dts, dtype=torch.float32, device=h.device)
+                vals = vals * _DRAFT_INV_T[h.device]
             full = torch.full((h.shape[0], self._fx_vocab), float("-inf"), dtype=torch.bfloat16, device=h.device)
             return full.scatter_(1, self._fx_idx[cand], vals.to(torch.bfloat16))
         sub = F.nv4_linear(h, self._fx_w, self._fx_s, self._fx_gs, cfg)
@@ -446,7 +467,18 @@ def _patch_moe_zero():
     _log("MoE decode ZERO ablation installed")
 
 
+def _patch_keep_graph():
+    # Debug: keep every captured cudaGraph_t so probes can list and disable kernel nodes (x/probes/probe_ablate.py).
+    import torch
+    C = torch.cuda.CUDAGraph
+    orig = C.__init__  # the pybind constructor reads keep_graph here, not in __new__
+    C.__init__ = lambda self, keep_graph=False, *a, **k: orig(self, True, *a, **k)
+    _log("CUDA graphs keep their cudaGraph_t (debug)")
+
+
 def register():
+    if os.environ.get("FP4X_KEEP_GRAPH") == "1":
+        _patch_keep_graph()
     if os.environ.get("FP4X_MOE_ZERO") == "1":
         _patch_moe_zero()
     if os.environ.get("FP4X_MOE_TAU"):
