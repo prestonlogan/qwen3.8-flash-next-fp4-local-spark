@@ -177,7 +177,7 @@ def _w6(X, L, H, S, O, M, N, K, XS, BM: tl.constexpr, BN: tl.constexpr, BK: tl.c
 
 
 @torch.no_grad()
-def quantize_w6(w, qmax=31):
+def quantize_w6(w, qmax=31, clip_search=0):
     """w: [N,K] float -> (lo [N,K/2] u8, hi [N,K/4] u8, s [N,K/32] f16), RTN g32. qmax < 31 fake-quantizes to fewer
     bits in the same layout (quality probes)."""
     n, k = w.shape
@@ -187,12 +187,75 @@ def quantize_w6(w, qmax=31):
     for a in range(0, n, 2048):
         f = w[a:a + 2048].float().view(-1, k // 32, 32)
         s = (f.abs().amax(-1, keepdim=True) / qmax).to(torch.float16).float().clamp_min(6.2e-5)
+        if clip_search:  # per-group MSE-optimal clipping of the scale (weight-only, no calibration data)
+            best = ((torch.round(f / s).clamp(-qmax - 1, qmax) * s - f) ** 2).sum(-1, keepdim=True); bs = s
+            for c in torch.linspace(0.70, 0.98, clip_search).tolist():
+                sc = (s * c).to(torch.float16).float().clamp_min(6.2e-5)
+                e = ((torch.round(f / sc).clamp(-qmax - 1, qmax) * sc - f) ** 2).sum(-1, keepdim=True)
+                m = e < best; best = torch.where(m, e, best); bs = torch.where(m, sc, bs)
+            s = bs
         q = (torch.round(f / s).clamp(-qmax - 1, qmax).to(torch.int32) + 32).view(-1, k)
         lo = q & 15; hi = q >> 4
         L[a:a + 2048] = (lo[:, 0::2] | (lo[:, 1::2] << 4)).to(torch.uint8)
         H[a:a + 2048] = (hi[:, 0::4] | (hi[:, 2::4] << 2) | (hi[:, 1::4] << 4) | (hi[:, 3::4] << 6)).to(torch.uint8)
         S[a:a + 2048] = s.squeeze(-1).to(torch.float16)
     return L, H, S
+
+
+def _w6_groups(f, qmax, clip, hw):
+    """per-g32 scales for f [R, G, 32], minimizing the hw-weighted squared error over a clip grid."""
+    s = (f.abs().amax(-1, keepdim=True) / qmax).to(torch.float16).float().clamp_min(6.2e-5)
+    if clip:
+        best = (((torch.round(f / s).clamp(-qmax - 1, qmax) * s - f) ** 2) * hw).sum(-1, keepdim=True); bs = s
+        for c in torch.linspace(0.70, 0.98, clip).tolist():
+            sc = (s * c).to(torch.float16).float().clamp_min(6.2e-5)
+            e = (((torch.round(f / sc).clamp(-qmax - 1, qmax) * sc - f) ** 2) * hw).sum(-1, keepdim=True)
+            m = e < best; best = torch.where(m, e, best); bs = torch.where(m, sc, bs)
+        s = bs
+    return s
+
+
+@torch.no_grad()
+def quantize_w6_awq(w, h, qmax=31, clip=0, alpha=-1.0):
+    """Activation-aware W6 g32 (quality probe): h [K] = mean x^2 per input channel. Quantizes W * t (t = a^alpha rounded to a power of 2,
+    a = sqrt(h), alpha grid-searched when < 0) minimizing sum_k h_k (W_hat - W)^2, with the scale search weighted
+    the same way. Returns (lo, hi, s, inv_t bf16 [K]); the caller multiplies x by inv_t."""
+    n, k = w.shape
+    a = h.float().clamp_min(1e-12).sqrt()
+    a = a / a.mean()
+    hw = (a * a).view(1, k // 32, 32)
+    rows = torch.randperm(n, device=w.device)[:min(n, 1024)]
+    def err(t, rr):
+        f = (w[rr].float() * t).view(-1, k // 32, 32)
+        sc = _w6_groups(f, qmax, clip, hw / (t.view(1, k // 32, 32) ** 2))
+        d = (torch.round(f / sc).clamp(-qmax - 1, qmax) * sc / t.view(1, k // 32, 32) - w[rr].float().view(-1, k // 32, 32))
+        return ((d * d) * hw).sum().item()
+    best_a = alpha
+    if alpha < 0:
+        best_a, be = 0.0, None
+        for al in [i / 10 for i in range(0, 11)]:
+            t = torch.exp2(torch.round(torch.log2(a ** al / (a ** al).mean())))
+            e = err(t, rows)
+            if be is None or e < be: be, best_a = e, al
+    t = torch.exp2(torch.round(torch.log2(a ** best_a / (a ** best_a).mean())))  # powers of 2: x * inv_t is exact in bf16
+    L = torch.empty((n, k // 2), dtype=torch.uint8, device=w.device)
+    H = torch.empty((n, k // 4), dtype=torch.uint8, device=w.device)
+    S = torch.empty((n, k // 32), dtype=torch.float16, device=w.device)
+    hw_t = hw / (t.view(1, k // 32, 32) ** 2)
+    for r0 in range(0, n, 2048):
+        f = (w[r0:r0 + 2048].float() * t).view(-1, k // 32, 32)
+        s = _w6_groups(f, qmax, clip, hw_t)
+        q = (torch.round(f / s).clamp(-qmax - 1, qmax).to(torch.int32) + 32).view(-1, k)
+        lo = q & 15; hi = q >> 4
+        L[r0:r0 + 2048] = (lo[:, 0::2] | (lo[:, 1::2] << 4)).to(torch.uint8)
+        H[r0:r0 + 2048] = (hi[:, 0::4] | (hi[:, 2::4] << 2) | (hi[:, 1::4] << 4) | (hi[:, 3::4] << 6)).to(torch.uint8)
+        S[r0:r0 + 2048] = s.squeeze(-1).to(torch.float16)
+    global _AWQ_LOG
+    _AWQ_LOG.append(best_a)
+    return L, H, S, (1.0 / t).to(torch.bfloat16)
+
+
+_AWQ_LOG = []
 
 
 @torch.no_grad()

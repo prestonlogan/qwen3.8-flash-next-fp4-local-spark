@@ -22,6 +22,8 @@ CFG_W8 = {(336, 10240): (32, 512, 4, 4), (10240, 320): (32, 64, 1, 8), (512, 256
 _stats = {"mx8": 0, "mx8_skip": 0}
 _DRAFT_INV_T = {}
 _LOWBIT_FOR = None  # set by _patch_mx8: B12xBlockscaledLinear -> its low-bit decode copy (or None)
+_DORDER = {}  # id(B12xBlockscaledLinear) -> (first-call index, (n, k)); keys FP4X_DENSE_STATS / FP4X_DENSE_AWQ
+_DSTATS = {}  # first-call index -> [sum x^2 per input channel (fp32, GPU), rows]
 
 
 def _log(msg):
@@ -50,12 +52,32 @@ def _patch_mx8():
     def mode_for(n, k):
         return "nv4" if (n, k) in nv4_shapes else dense_mode
 
+    stats_on = os.environ.get("FP4X_DENSE_STATS") == "1"  # accumulate prefill input stats (calibration server)
+    awq = None
+    if os.environ.get("FP4X_DENSE_AWQ"):  # activation-aware W6/W5 quantization from a FP4X_DENSE_STATS dump
+        awq = torch.load(os.environ["FP4X_DENSE_AWQ"])
+        _log(f"dense awq: {len(awq)} layer stats from {os.environ['FP4X_DENSE_AWQ']}")
+
     def lowbit(self, w, s):
         key = id(self)
         q = cache.get(key)
         if q is None and not torch.cuda.is_current_stream_capturing():
             wf = F.mx8_dequant(w, s)
-            q = cache[key] = F.quantize_w6(wf, int(os.environ.get("FP4X_DENSE_QMAX", "31"))) if mode_for(*w.shape) == "w6" else F.quantize_nv4(wf)
+            qmax = int(os.environ.get("FP4X_DENSE_QMAX", "31")); clip = int(os.environ.get("FP4X_DENSE_CLIP", "0"))
+            h = None
+            if awq is not None:
+                idx = _DORDER.get(key, (None,))[0]
+                st = awq.get(idx)
+                if st is not None and st["h"].numel() == w.shape[1] and st["shape"] in (None, tuple(w.shape)):
+                    h = st["h"].to(w.device)
+                elif len(cache) < 3: _log(f"dense awq: no stats for layer {idx} {tuple(w.shape)}")
+            if mode_for(*w.shape) != "w6":
+                q = F.quantize_nv4(wf)
+            elif h is None:
+                q = F.quantize_w6(wf, qmax, clip)
+            else:
+                q = F.quantize_w6_awq(wf, h, qmax, clip, float(os.environ.get("FP4X_DENSE_AWQ_A", "-1")))
+            cache[key] = q
             del wf
             if len(cache) in (1, 200): _log(f"dense {dense_mode}: quantized {len(cache)} layers")
         return q
@@ -75,6 +97,13 @@ def _patch_mx8():
     seen = set()
 
     def run(self, source, bias):
+        if id(self) not in _DORDER:
+            _DORDER[id(self)] = (len(_DORDER), tuple(self.packed.weight.values.shape) if hasattr(getattr(self.packed, "weight", None), "values") else None, id(self.packed))
+        if stats_on and source.dim() == 2 and source.shape[0] > maxm and not torch.cuda.is_current_stream_capturing():
+            st = _DSTATS.get(_DORDER[id(self)][0])
+            if st is None:
+                st = _DSTATS[_DORDER[id(self)][0]] = [torch.zeros(source.shape[1], dtype=torch.float32, device=source.device), 0]
+            st[0] += source.float().pow(2).sum(0); st[1] += source.shape[0]
         key = (self.recipe, tuple(source.shape), bias is None, getattr(self.packed, "padded_in_features", None),
                getattr(self.packed, "in_features", None))
         if key not in seen and len(seen) < 60:
@@ -96,6 +125,8 @@ def _patch_mx8():
                     q = lowbit(self, w, s)
                     if q is not None:
                         if mode_for(n, k) == "w6":
+                            if len(q) == 4:  # awq: weights were quantized as W * s per input channel
+                                return F.w6_linear((source * q[3]).to(source.dtype), *q[:3], CFG_W6.get((n, k)) or (32, 256, 1, 4))
                             return F.w6_linear(source, *q, CFG_W6.get((n, k)) or (32, 256, 1, 4))
                         return F.nv4_linear(source, *q, CFG_NV4.get((n, k)) or (32, 256 if k % 256 == 0 else 128 if k % 128 == 0 else 64, 4))
                 if os.environ.get("FP4X_MX8_ZERO") == "1":
