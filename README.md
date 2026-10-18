@@ -1,8 +1,8 @@
-# Qwen3.8-Flash-Next-FP4-Local on one DGX Spark: ~51 tok/s prose
+# Qwen3.8-Flash-Next-FP4-Local on one DGX Spark: ~53 tok/s prose
 
 This is a single-Spark serving recipe for [`nvidia/Qwen3.8-Flash-Next-FP4-Local`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local), NVIDIA's QAD-trained FP4 checkpoint. It adds a small vLLM plugin (`x/fp4patch.py` plus Triton kernels in `x/fp4x_kernels.py`) that speeds up the per-token decode path on GB10.
 
-It starts from the model card's Spark recipe and runs on the `eugr/spark-vllm-b12x` image (vLLM 0.1.dev21830, b12x backends). The weights are unchanged. Every change happens at serve time.
+It starts from the model card's Spark recipe and runs on the `eugr/spark-vllm-b12x` image (vLLM 0.1.dev21830, b12x backends). The target weights are unchanged. Every change happens at serve time, plus a self-distilled draft-model patch that can only affect speed.
 
 Companion to [Qwen3.8-Flash-Next-Single-DGX-Spark-Optimized](https://github.com/prestonlogan/Qwen3.8-Flash-Next-Single-DGX-Spark-Optimized), which optimizes the pre-QAD NVFP4 checkpoint. Several kernels here are ports from that repo.
 
@@ -12,11 +12,11 @@ All numbers are tok/s, decode only, 400-token completions, one stream unless not
 
 | | Model card recipe | + 3 MTP drafts + async scheduling | **This repo** |
 |---|---|---|---|
-| Prose, greedy | 36.7 | 39.9 | **50.7 – 51.6** |
-| Prose, sampled (T=1.0, top-p 0.95, top-k 20) | – | 36.7 | **49 – 51** |
-| Code / JSON, greedy | 59 – 61 | 60 / 58 | 68 / 65.5 |
-| Prose at 110k-token context | – | 40.8 | **47.2** |
-| Aggregate at 2 / 4 streams | 51 / 68 | 58 / 75 | **74 / 98** |
+| Prose, greedy | 36.7 | 39.9 | **52.7 – 53.1** |
+| Prose, sampled (T=1.0, top-p 0.95, top-k 20) | – | 36.7 | **50.9** |
+| Code / JSON, greedy | 59 – 61 | 60 / 58 | 69 / 65 – 69 |
+| Prose at 110k-token context | – | 40.8 | **49.9** |
+| Aggregate at 2 / 4 streams | 51 / 68 | 58 / 75 | **74 / 98** (before r32a) |
 | ms per decode step | 64 | 58 | **40.4** |
 
 **Quality.** Decode-path perplexity is measured with prompts forced through the M≤16 kernels (`exp_q.sh`), over 12 texts and 9,588 tokens. It is **2.634** here vs **2.650** for the card recipe. The stock b12x path quantizes activations at small M, and the exact MXFP8 GEMV here wins back more than the 6-bit and NVFP4 weight copies lose.
@@ -25,7 +25,7 @@ Functional gates (`gates.py`) all pass: single and multi-turn tool calls, strict
 
 Speculative decoding stays lossless. Greedy output matches argmax, and sampled output uses standard rejection sampling.
 
-**Trade-off.** It uses 2 MTP drafts. With these cheaper steps, 2 drafts win on prose and sampled text. 3 drafts would give code/JSON about 72/71 tok/s but drop prose to about 49 greedy and 47 sampled. To get the 3-draft behaviour, set `FP4_SPEC='{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'`.
+**Trade-off.** It uses 2 MTP drafts. With these cheaper steps, 2 drafts win on prose and sampled text. 3 drafts would give code/JSON about 75/72 tok/s but drop prose to about 51.7 greedy and 48.8 sampled. To get the 3-draft behaviour, set `FP4_SPEC='{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'`.
 
 ## Quick start
 
@@ -37,6 +37,7 @@ Requirements:
 ```bash
 git clone https://github.com/prestonlogan/qwen3.8-flash-next-fp4-local-spark ~/fp4local
 cd ~/fp4local
+./t8/build_patch.sh               # one-time: merge the r32a drafter LoRA -> x/mtp_patch_r32a.safetensors (~1 min, CPU)
 ./serve.sh 5810                    # detached container "fp4local", OpenAI API on :5810
 nohup ./watchdog.sh >/dev/null 2>&1 &   # optional: kills the container if MemAvailable < 1.5 GiB
 ```
@@ -59,6 +60,7 @@ nohup ./watchdog.sh >/dev/null 2>&1 &   # optional: kills the container if MemAv
 | `FP4X_HC=1 FP4X_HC_W8=1` | Hyper-connection mixer matmuls (97 target layers) as int8 g64. Was cuBLAS BF16. | quality-gated (PPL 2.635) | ~2.4 ms |
 | `FP4X_MTP_W8=1` | MTP layer BF16 linears as int8 g64. | draft only | ~1 ms |
 | `FP4X_DRAFT_VOCAB=dv65k.txt` | MTP draft head over a 65k-token NVFP4 subset instead of 248k. | draft only | ~2.5 ms |
+| `FP4X_MTP_PATCH=…/mtp_patch_r32a.safetensors` | Self-distilled MTP drafter weights, applied right after load (see below). | draft only | tok/step +4.5% |
 | `FP4X_FAST_HEAD=1` | Target LM head: INT2 coarse pass, then exact MXFP8 rescoring of the top 512. A self-check runs at build time. | top-512 exact (argmax agree 1.000) | ~1 ms |
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Removes a post-load dip in MemAvailable, to about 1.5 GiB, that could OOM the box. | – | stability |
 
@@ -87,11 +89,15 @@ Greedy prose2 tok/s, ms/step, and tokens per step. Raw JSONL is in `results/`.
 | E15 | + INT2 fast head | 48.9 | 46.5 | 2.27 | 72.3 |
 | E16b | HC as NVFP4 | 27.3 | 39.3 | **1.07** | broken |
 | E17 | PLE io_uring QD 256 | 49.5 | 46.7 | 2.31 | 72.1 |
-| **E18** | **E15 with 2 drafts (shipped)** | **50.7** | **40.4** | 2.05 | 67.7 |
+| E18 | E15 with 2 drafts | 50.7 | 40.4 | 2.05 | 67.7 |
 | E19 | + PLE spin-wait | 50.6 | 40.5 | 2.05 | 67.4 |
 | E20b | adaptive draft depth (≤3, start 2) | 50.2 | 42.5 | 2.14 | 72.2 |
+| AB | r32a drafter, hot-swapped, same-process A/B, 2 rounds each | 52.8 vs 50.4 | 40.9 | 2.16 vs 2.06 | 68.3 vs 67.1 |
+| **E21** | **E18 + r32a drafter (shipped)** | **52.7** | **40.5** | 2.14 | 68.9 |
+| E22 | E21 with 3 drafts | 51.7 | 46.4 | 2.40 | 75.5 |
+| SHIP | shipped `serve.sh` defaults | 53.1 | 40.4 | 2.15 | 69.2 |
 
-Sampled prose: E15 47.4, **E18 50.8**, E20b 48.6.
+Sampled prose: E15 47.4, E18 50.8, E20b 48.6, **E21 50.9**, E22 48.8.
 
 Decode-path PPL (`results/ppl_q.jsonl`):
 
@@ -106,6 +112,15 @@ Decode-path PPL (`results/ppl_q.jsonl`):
 | out_proj NV4 | 2.7696 |
 | all-dense NV4 | 2.7903 |
 
+## Drafter self-distillation (r32a)
+
+The FP4-Local MTP drafter, LM head and embeddings are **bit-identical** to the pre-QAD checkpoint (only the 48 target layers changed with QAD), so the companion repo's r32a adapter applies directly. That adapter is a rank-32 LoRA on the drafter's dense matrices and norms, trained by FastMTP-style self-distillation on the target's own greedy prose.
+
+- `t8/build_patch.sh` merges `adapters/r32a/lora_r32a.pt` into 22 BF16 drafter tensors. The output's SHA-256 matches the companion repo's patch exactly.
+- `FP4X_MTP_PATCH` copies the patch into the drafter's parameters right after `load_model`, before profiling, graph capture and the lazy draft-side W8 copies. Swapping tensors inside the loader's iterator is rejected by b12x's checkpoint routing.
+- Served same-process A/B: prose greedy +4.7% (tok/step 2.06 → 2.16), sampled +2%, code +2%. Output is unchanged, because the target verifies every token.
+- Retraining on FP4-Local's own data (`t8/`: `gen_tok.py` → `capture.py` → `trainrun.sh`) matched r32a offline (val tok/step 2.538 vs 2.544), and continuing from r32a added only +0.2%. This matches the companion repo's finding that more teacher-forced data doesn't transfer. `results/t8_offline.txt` has the logs.
+
 ## Dead ends, so you don't repeat them
 
 - **NVFP4 hyper-connection mixers.** These carry about 9% relative error per matmul, vs 0.8% for int8, and 194 of them in series wreck the output. NVFP4 on all dense layers or on `out_proj` costs +5–6% PPL.
@@ -117,6 +132,8 @@ Decode-path PPL (`results/ppl_q.jsonl`):
   - Back to back the same batch takes about 0.25 ms. The difference is CPU idle wake after the ~40 ms GPU wait. NVMe power states and queue depth are not the cause.
   - Queue depth 256, spin-waiting and an NVMe keepalive did not move end-to-end speed.
   - Row reuse is only 18–39%, so a RAM row cache isn't worth it.
+- **Retraining the drafter** on FP4-Local's own greedy outputs: no better than r32a (see above).
+- **3 drafts with r32a**: 51.7 greedy / 48.8 sampled, vs 52.7 / 50.9 with 2 drafts. Code/JSON improve to 75/72.
 - **RAM PLE** (`VLLM_PLE_TABLE_MEMORY=ram`). The 28.8 GB table counts against the GPU memory budget and doesn't fit next to the KV cache.
 - **Torch profiler.** One profiler run was followed by a hard reset of the Spark on the next reload. Use CUDA-event spans instead (`x/probes/probe16*.py`).
 
@@ -131,7 +148,10 @@ x/fp4patch-0.1.dist-info/   entry point registration
 x/dv65k.txt           draft-vocab token ids (64,877 + tail)
 x/fp4ext.py, x/rpc.py worker extension + /collective_rpc client for in-process probes (dev mode only)
 x/stack2.txt, x/spec*.json  flag sets used by the experiments (@ROOT@ is substituted by exp.sh)
-x/probes/             in-process timing/tuning scripts (run via rpc.py fx_exec /x/probes/<name>.py)
+x/probes/             in-process timing/tuning scripts (run via rpc.py fx_exec /x/probes/<name>.py); mtp_swap.py hot-swaps drafter weights
+adapters/r32a/        drafter LoRA (from the companion repo); t8/build_patch.sh merges it
+t8/                   drafter self-distillation pipeline (corpus, capture, train, merge)
+ab_swap.sh            same-process A/B of a hot-swapped drafter patch
 exp.sh, exp_q.sh      restart-and-benchmark / decode-path-PPL harnesses
 q38bench.py, ppl.py, gates.py, t8_long.py, summ.py   benchmarks
 results/              raw JSONL for every run above

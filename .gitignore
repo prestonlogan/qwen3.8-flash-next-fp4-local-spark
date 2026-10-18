@@ -3,3 +3,7 @@ logs/
 __pycache__/
 *.pyc
 .DS_Store
+*.safetensors
+*.pt
+!adapters/r32a/lora_r32a.pt
+t8/data/

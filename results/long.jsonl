@@ -1,3 +1,5 @@
 {"tag": "L150k_spec2", "T": 0.0, "prompt_tokens": 110055, "completion_tokens": 600, "ttft_s": 45.7, "decode_tps": 40.82, "tok_per_step": 2.08, "per_pos": [0.698, 0.382, 0.0, 0.0]}
 {"tag": "L150k_spec2_warm", "T": 0.0, "prompt_tokens": 110055, "completion_tokens": 600, "ttft_s": 0.3, "decode_tps": 40.04, "tok_per_step": 2.051, "per_pos": [0.678, 0.373, 0.0, 0.0]}
 {"tag": "L255k_spec2", "T": 0.0, "prompt_tokens": 255053, "completion_tokens": 600, "ttft_s": 70.0, "decode_tps": 39.07, "tok_per_step": 2.044, "per_pos": [0.679, 0.365, 0.0, 0.0]}
+{"tag": "SHIP_long110k", "T": 0.0, "prompt_tokens": 110055, "completion_tokens": 600, "ttft_s": 45.9, "decode_tps": 49.9, "tok_per_step": 2.066, "per_pos": [0.686, 0.379, 0.0, 0.0]}
+{"tag": "GW_long110k", "T": 0.0, "prompt_tokens": 110055, "completion_tokens": 600, "ttft_s": 45.5, "decode_tps": 47.15, "tok_per_step": 1.939, "per_pos": [0.631, 0.307, 0.0, 0.0]}

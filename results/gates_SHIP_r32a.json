@@ -1,0 +1,73 @@
+{
+ "tool_single": {
+  "ok": true,
+  "calls": [
+   [
+    "get_weather",
+    "{\"city\": \"Paris\", \"unit\": \"c\"}"
+   ]
+  ]
+ },
+ "tool_multi_turn": {
+  "ok": true,
+  "args": {
+   "origin": "Boston",
+   "destination": "Denver",
+   "date": "2026-10-14"
+  },
+  "final": "Here are the flights from Boston to Denver on 2026-10-14:\n\n| Flight | Price |\n|--------|-------|\n| United UA123 | $212 |\n| JetBlue B6 99 | $189 |\n\nThe cheapest option is **JetBlue B6 99 at $189**. Wou"
+ },
+ "json_strict": {
+  "ok": true,
+  "out": "{\n  \"name\": \"Elara Vance\",\n  \"age\": 34,\n  \"tags\": [\"pilot\", \"botanist\", \"explorer\"]\n}"
+ },
+ "json_guided": {
+  "ok": true,
+  "out": "{\"planets\": [\"Mercury\", \"Venus\", \"Earth\", \"Mars\"]}"
+ },
+ "reasoning": {
+  "ok": 4,
+  "of": 4,
+  "items": [
+   {
+    "ok": true,
+    "got": [
+     "5"
+    ],
+    "reasoning_len": 299
+   },
+   {
+    "ok": true,
+    "got": [
+     "403"
+    ],
+    "reasoning_len": 203
+   },
+   {
+    "ok": true,
+    "got": [
+     "yes"
+    ],
+    "reasoning_len": 315
+   },
+   {
+    "ok": true,
+    "got": [
+     "6"
+    ],
+    "reasoning_len": 772
+   }
+  ]
+ },
+ "code_exec": {
+  "ok": true
+ },
+ "summary": {
+  "tool_single": true,
+  "tool_multi_turn": true,
+  "json_strict": true,
+  "json_guided": true,
+  "reasoning": "4/4",
+  "code_exec": true
+ }
+}

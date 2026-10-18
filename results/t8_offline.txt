@@ -1,0 +1,40 @@
+[ho@start] anchors=5340 chained=[0.7403, 0.5034, 0.3373] cond=[0.74, 0.68, 0.67] tok/step=2.5809 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@start] anchors=9476 chained=[0.7016, 0.4482, 0.281] cond=[0.702, 0.639, 0.627] tok/step=2.4308 teacher_match=0.9091 shdiff=[]
+[val@start] sampled T=1.0 acc=[0.7246, 0.6441, 0.5948] E[tok/step]=2.5097
+[ho@start] sampled T=1.0 acc=[0.7563, 0.685, 0.6368] E[tok/step]=2.6392
+[ho@start] anchors=5340 chained=[0.7858, 0.5524, 0.3749] cond=[0.786, 0.703, 0.679] tok/step=2.7131 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@start] anchors=9476 chained=[0.7438, 0.4898, 0.3105] cond=[0.744, 0.658, 0.634] tok/step=2.5440 teacher_match=0.9091 shdiff=[]
+[val@start] sampled T=1.0 acc=[0.7734, 0.6668, 0.6064] E[tok/step]=2.6417
+[ho@start] sampled T=1.0 acc=[0.8056, 0.7042, 0.6442] E[tok/step]=2.7735
+[ho@start] anchors=5340 chained=[0.7403, 0.503, 0.3369] cond=[0.74, 0.679, 0.67] tok/step=2.5801 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@start] anchors=9476 chained=[0.7015, 0.4481, 0.2805] cond=[0.701, 0.639, 0.626] tok/step=2.4300 teacher_match=0.9091 shdiff=[]
+[val@start] sampled T=1.0 acc=[0.7246, 0.6441, 0.5949] E[tok/step]=2.5098
+[ho@start] sampled T=1.0 acc=[0.7563, 0.6851, 0.6369] E[tok/step]=2.6394
+[val@44] anchors=9476 chained=[0.7371, 0.4834, 0.3043] cond=[0.737, 0.656, 0.63] tok/step=2.5249 teacher_match=0.9091 shdiff=[]
+[ho@44] anchors=5340 chained=[0.7801, 0.5476, 0.3639] cond=[0.78, 0.702, 0.665] tok/step=2.6916 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@44] sampled T=1.0 acc=[0.7704, 0.663, 0.6022] E[tok/step]=2.6293
+[ho@44] sampled T=1.0 acc=[0.8026, 0.7004, 0.6377] E[tok/step]=2.7592
+[val@88] anchors=9476 chained=[0.7404, 0.4903, 0.3077] cond=[0.74, 0.662, 0.628] tok/step=2.5384 teacher_match=0.9091 shdiff=[]
+[ho@88] anchors=5340 chained=[0.7852, 0.5534, 0.3693] cond=[0.785, 0.705, 0.667] tok/step=2.7079 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@88] sampled T=1.0 acc=[0.7727, 0.6662, 0.6062] E[tok/step]=2.6396
+[ho@88] sampled T=1.0 acc=[0.8056, 0.704, 0.6419] E[tok/step]=2.7727
+[val@132] anchors=9476 chained=[0.7361, 0.4866, 0.3071] cond=[0.736, 0.661, 0.631] tok/step=2.5298 teacher_match=0.9091 shdiff=[]
+[ho@132] anchors=5340 chained=[0.7839, 0.5517, 0.3715] cond=[0.784, 0.704, 0.673] tok/step=2.7071 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@132] sampled T=1.0 acc=[0.7726, 0.6674, 0.6084] E[tok/step]=2.6417
+[ho@132] sampled T=1.0 acc=[0.8054, 0.7054, 0.6448] E[tok/step]=2.7759
+[val@176] anchors=9476 chained=[0.7371, 0.4889, 0.3093] cond=[0.737, 0.663, 0.633] tok/step=2.5354 teacher_match=0.9091 shdiff=[]
+[ho@176] anchors=5340 chained=[0.7861, 0.5534, 0.3725] cond=[0.786, 0.704, 0.673] tok/step=2.7120 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@176] sampled T=1.0 acc=[0.7727, 0.6673, 0.609] E[tok/step]=2.6426
+[ho@176] sampled T=1.0 acc=[0.806, 0.7057, 0.6447] E[tok/step]=2.7775
+[ho@start] anchors=5340 chained=[0.7858, 0.5521, 0.3743] cond=[0.786, 0.703, 0.678] tok/step=2.7122 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@start] anchors=9476 chained=[0.7438, 0.4896, 0.3104] cond=[0.744, 0.658, 0.634] tok/step=2.5437 teacher_match=0.9091 shdiff=[]
+[val@start] sampled T=1.0 acc=[0.7734, 0.6668, 0.6065] E[tok/step]=2.6416
+[ho@start] sampled T=1.0 acc=[0.8056, 0.7042, 0.6442] E[tok/step]=2.7736
+[val@44] anchors=9476 chained=[0.7434, 0.4906, 0.3095] cond=[0.743, 0.66, 0.631] tok/step=2.5435 teacher_match=0.9091 shdiff=[]
+[ho@44] anchors=5340 chained=[0.786, 0.5539, 0.3743] cond=[0.786, 0.705, 0.676] tok/step=2.7142 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@44] sampled T=1.0 acc=[0.7743, 0.6687, 0.6097] E[tok/step]=2.6482
+[ho@44] sampled T=1.0 acc=[0.8068, 0.7057, 0.6455] E[tok/step]=2.7791
+[val@88] anchors=9476 chained=[0.7451, 0.4919, 0.3118] cond=[0.745, 0.66, 0.634] tok/step=2.5489 teacher_match=0.9091 shdiff=[]
+[ho@88] anchors=5340 chained=[0.788, 0.5534, 0.3757] cond=[0.788, 0.702, 0.679] tok/step=2.7170 teacher_match=0.9238 shdiff=[0.0165, 0.0154, 0.0152, 0.0151, 0.0155, 0.015]
+[val@88] sampled T=1.0 acc=[0.7746, 0.6688, 0.6097] E[tok/step]=2.6484
+[ho@88] sampled T=1.0 acc=[0.8067, 0.7056, 0.6466] E[tok/step]=2.7791

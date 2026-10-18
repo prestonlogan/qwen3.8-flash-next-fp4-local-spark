@@ -317,7 +317,52 @@ def _patch_ple_spin():
     _log("PLE read spin-wait installed")
 
 
+def _mtp_patch_target(params, ck):
+    """Runtime parameter view for a checkpoint-named MTP tensor (q/k/v and shared gate/up are fused at load)."""
+    n = ck[len("mtp."):-len(".weight")]
+    for a, b, lo, hi in (("self_attn.q_proj", "self_attn.qkv_proj", 0, 12288), ("self_attn.k_proj", "self_attn.qkv_proj", 12288, 12800),
+                         ("self_attn.v_proj", "self_attn.qkv_proj", 12800, 13312),
+                         ("shared_expert.gate_proj", "shared_expert.gate_up_proj", 0, 640),
+                         ("shared_expert.up_proj", "shared_expert.gate_up_proj", 640, 1280)):
+        if n.endswith(a):
+            return params["model." + n[:-len(a)] + b + ".weight"].data[lo:hi]
+    if n.endswith("hyper_connection.input_mix_weight_down") and "layers" in n:
+        return params["model." + n + "_block_inject.weight"].data[:320]
+    return params["model." + n + ".weight"].data
+
+
+def _patch_mtp_weights():
+    # Overwrite MTP drafter tensors (checkpoint names, e.g. the merged r32a self-distillation LoRA) right after the
+    # model runner loads, before profiling/capture and before any lazy draft-side W8 copies. Draft-only.
+    import torch
+    from safetensors.torch import load_file
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    path = os.environ["FP4X_MTP_PATCH"]
+    orig = GPUModelRunner.load_model
+
+    def load_model(self, *a, **k):
+        out = orig(self, *a, **k)
+        params = dict(self.speculator.model.named_parameters())
+        patch = load_file(path)
+        with torch.no_grad():
+            for ck, t in patch.items():
+                dst = _mtp_patch_target(params, ck)
+                assert dst.shape == t.shape, (ck, dst.shape, t.shape)
+                dst.copy_(t.to(dst.device, dst.dtype))
+        torch.cuda.synchronize()
+        _log(f"MTP patch {path}: applied {len(patch)} tensors")
+        return out
+
+    GPUModelRunner.load_model = load_model
+    _log(f"MTP weight patch installed ({path})")
+
+
 def register():
+    if os.environ.get("FP4X_MTP_PATCH"):
+        try:
+            _patch_mtp_weights()
+        except Exception as e:
+            _log(f"MTP weight patch failed: {type(e).__name__}: {e}")
     if os.environ.get("FP4X_PLE_SPIN") == "1":
         try:
             _patch_ple_spin()
