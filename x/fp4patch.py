@@ -55,7 +55,7 @@ def _patch_mx8():
         q = cache.get(key)
         if q is None and not torch.cuda.is_current_stream_capturing():
             wf = F.mx8_dequant(w, s)
-            q = cache[key] = F.quantize_w6(wf) if mode_for(*w.shape) == "w6" else F.quantize_nv4(wf)
+            q = cache[key] = F.quantize_w6(wf, int(os.environ.get("FP4X_DENSE_QMAX", "31"))) if mode_for(*w.shape) == "w6" else F.quantize_nv4(wf)
             del wf
             if len(cache) in (1, 200): _log(f"dense {dense_mode}: quantized {len(cache)} layers")
         return q
@@ -118,7 +118,9 @@ def _patch_hc():
     zero = os.environ.get("FP4X_HC_ZERO") == "1"
     w8 = os.environ.get("FP4X_HC_W8") == "1"
     hc_nv4 = os.environ.get("FP4X_HC_NV4") == "1"
+    hc_w6 = os.environ.get("FP4X_HC_W6") == "1"  # quality probe: unfused W6 g32 mixers
     q4 = {}
+    q6 = {}
     q8 = {}
     cnt = [0]
 
@@ -134,6 +136,13 @@ def _patch_hc():
                 qs = q4[key] = F.quantize_nv4(w)
             if qs is not None:
                 return F.nv4_linear(x.contiguous(), *qs, CFG_HC_NV4.get(tuple(w.shape)) or (32, 64, 4, 1))
+        if hc_w6 and allow_w8 and x.shape[0] <= 16 and tuple(w.shape) != (512, 2560):  # mixers only, not router gates
+            key = (w.data_ptr(), tuple(w.shape))
+            qs = q6.get(key)
+            if qs is None and not torch.cuda.is_current_stream_capturing():
+                qs = q6[key] = F.quantize_w6(w)
+            if qs is not None:
+                return F.w6_linear(x.contiguous(), *qs, (32, 256 if w.shape[1] % 256 == 0 else 64, 1, 4))
         if w8 and allow_w8 and x.shape[0] <= 16:
             key = (w.data_ptr(), tuple(w.shape))
             qs = q8.get(key)
@@ -261,7 +270,8 @@ def _patch_draft_vocab():
         self._fx_vocab = lm.weight.shape[0]
         _log(f"draft vocab head built: {idx.numel()} ids, {(self._fx_w.numel() + self._fx_s.numel()) / 1e6:.0f} MB")
         if dc:
-            q = [F.quantize_int2(F.dequant_nv4(self._fx_w[a:a + 8192], self._fx_s[a:a + 8192], self._fx_gs)) for a in range(0, idx.numel(), 8192)]
+            dg = int(os.environ.get("FP4X_DRAFT_INT2_G", "16"))
+            q = [F.quantize_int2(F.dequant_nv4(self._fx_w[a:a + 8192], self._fx_s[a:a + 8192], self._fx_gs), group=dg) for a in range(0, idx.numel(), 8192)]
             self._fx_c = (torch.cat([t[0] for t in q]), torch.cat([t[1] for t in q]))
             _log(f"draft head INT2 coarse + exact NVFP4 refine of the top {dc}: {sum(t.numel() * t.element_size() for t in self._fx_c) / 1e6:.0f} MB")
 
@@ -301,6 +311,7 @@ def _patch_fast_head():
     from vllm.models.qwen4_exp.nvidia import model as MD
     import fp4x_kernels as F
     C = int(os.environ.get("FP4X_HEAD_C", "512"))
+    G = int(os.environ.get("FP4X_HEAD_G", "16"))  # INT2 scale group size (32: 16% fewer bytes; use C=1024 with it)
     orig = MD.Qwen4ExpForCausalLM.compute_logits
     st = {}
 
@@ -314,21 +325,21 @@ def _patch_fast_head():
         P, S, gs = None, None, None
         wf = F.mx8_dequant(w, sc)
         st["int2"] = os.environ.get("FP4X_HEAD_COARSE", "int2") == "int2"
-        st["coarse"] = F.quantize_int2(wf) if st["int2"] else F.quantize_nv4(wf); del wf
+        st["coarse"] = F.quantize_int2(wf, group=G) if st["int2"] else F.quantize_nv4(wf); del wf
         ref = orig(self, h)
         st["V"], st["dtype"] = ref.shape[-1], ref.dtype
         out = fast(self, h)
         same = (out.argmax(-1) == ref.argmax(-1)).float().mean().item()
         top = torch.topk(ref.float(), 20, dim=-1).indices
         err = (out.float().gather(1, top) - ref.float().gather(1, top)).abs().max().item()
-        _log(f"fast head built: C={C} coarse {sum(t.numel() for t in st['coarse'][:2]) / 1e6:.0f} MB; self-check argmax agree {same:.3f}, top20 max|d| {err:.2e}")
+        _log(f"fast head built: C={C} G={G} coarse {sum(t.numel() for t in st['coarse'][:2]) / 1e6:.0f} MB; self-check argmax agree {same:.3f}, top20 max|d| {err:.2e}")
         if same < 1.0 or err > 1e-2:
             st["off"] = True; _log("fast head self-check failed -> disabled")
 
     def fast(self, h):
         if st["int2"]:
             P, S = st["coarse"]
-            coarse = F.int2_logits(h, P, S, st["w"].shape[0]).to(torch.bfloat16)
+            coarse = F.int2_logits(h, P, S, st["w"].shape[0], out_dtype=torch.bfloat16)
         else:
             P, S, gs = st["coarse"]
             coarse = F.nv4_linear(h, P, S, gs, (32, 256, 4))
@@ -349,6 +360,87 @@ def _patch_fast_head():
 
     MD.Qwen4ExpForCausalLM.compute_logits = compute_logits
     _log("fast target head patch installed")
+
+
+def _patch_ple_early():
+    # Exact: overlap the disk PLE read with the next step's attention-metadata kernels. Stock order after the draft
+    # graphs is [attention metadata kernels ~0.24 ms] -> [PLE hash + id copy] -> CPU waits on the ids -> 0.29 ms disk
+    # read while the GPU idles -> verify graph. Here the model-state inputs (n-gram context + PLE hash/id staging, on a
+    # side stream) are produced before the metadata kernels are enqueued, and the blocking read + row lookup run where
+    # stock vLLM asked for them, so the read overlaps the metadata kernels.
+    import builtins, contextlib, torch
+    from vllm.models.qwen4_exp.nvidia import model_state as MS
+    from b12x.sequence.ple_embedding import _disk as PD
+    S = {"early": False, "pending": [], "cache": None, "side": None, "n": 0}
+    orig_run = PD.DiskTable._run
+
+    def finish_all():
+        main = torch.cuda.current_stream()
+        while S["pending"]:
+            S["pending"].pop(0)(main)
+
+    def run(self, binding, *, state, token_count):
+        if not S["early"]:
+            return orig_run(self, binding, state=state, token_count=token_count)
+        layout = self.layout
+        main = torch.cuda.current_stream()
+        if S["side"] is None:
+            S["side"] = torch.cuda.Stream(device=main.device)
+        side = S["side"]
+        side.wait_stream(main)
+        stack = contextlib.ExitStack()
+        with torch.cuda.stream(side):
+            stack.enter_context(self._cache.transaction())
+            state.hash_state.run(binding._hash_binding, token_count=token_count)
+            count = token_count * layout.head_count
+            self._cache._stage_ids(binding._ids, count)
+
+        def finish(main_stream):
+            try:
+                with torch.cuda.stream(side):
+                    self._cache._read_staged(count)
+                    if token_count:
+                        weight_scale = self.weight_scale if self._cache.scale_row_bytes else binding.weight_scale
+                        state.run_lookup(self.weight, weight_scale, binding.weight_scale_2, binding._ids,
+                                         binding.num_tokens, binding.out, token_count=token_count)
+            finally:
+                stack.close()  # records the cache-done event on the side stream
+                main_stream.wait_stream(side)
+
+        S["pending"].append(finish)
+
+    PD.DiskTable._run = run
+    orig_pa, orig_pi = MS.Qwen4ExpModelState.prepare_attn, MS.Qwen4ExpModelState.prepare_inputs
+
+    def prepare_attn(self, input_batch, cudagraph_mode, *a, for_capture=False, **k):
+        if (builtins.__dict__.get("_fx_ple_early", True) and self.uses_ngram_embedding and not for_capture
+                and not torch.cuda.is_current_stream_capturing()
+                and 0 < input_batch.num_tokens <= 16 and getattr(self, "_fx_req_states", None) is not None):
+            finish_all()
+            S["early"] = True
+            try:
+                res = orig_pi(self, input_batch, self._fx_req_states)
+            finally:
+                S["early"] = False
+            S["cache"] = (input_batch, res)
+            S["n"] += 1
+            if S["n"] in (1, 1000): _log(f"PLE early staging: step {S['n']} ({input_batch.num_tokens} tokens)")
+        return orig_pa(self, input_batch, cudagraph_mode, *a, for_capture=for_capture, **k)
+
+    def prepare_inputs(self, input_batch, req_states):
+        self._fx_req_states = req_states
+        c = S["cache"]
+        if c is not None and c[0] is input_batch:
+            S["cache"] = None
+            finish_all()
+            return c[1]
+        S["cache"] = None
+        finish_all()
+        return orig_pi(self, input_batch, req_states)
+
+    MS.Qwen4ExpModelState.prepare_attn = prepare_attn
+    MS.Qwen4ExpModelState.prepare_inputs = prepare_inputs
+    _log("PLE early staging installed")
 
 
 def _patch_ple_qd():
@@ -496,6 +588,11 @@ def register():
             _patch_ple_spin()
         except Exception as e:
             _log(f"PLE spin patch failed: {type(e).__name__}: {e}")
+    if os.environ.get("FP4X_PLE_EARLY") == "1":
+        try:
+            _patch_ple_early()
+        except Exception as e:
+            _log(f"PLE early staging patch failed: {type(e).__name__}: {e}")
     if os.environ.get("FP4X_PLE_QD"):
         try:
             _patch_ple_qd()

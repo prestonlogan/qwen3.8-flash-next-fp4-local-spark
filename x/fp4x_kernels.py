@@ -177,16 +177,17 @@ def _w6(X, L, H, S, O, M, N, K, XS, BM: tl.constexpr, BN: tl.constexpr, BK: tl.c
 
 
 @torch.no_grad()
-def quantize_w6(w):
-    """w: [N,K] float -> (lo [N,K/2] u8, hi [N,K/4] u8, s [N,K/32] f16), RTN g32."""
+def quantize_w6(w, qmax=31):
+    """w: [N,K] float -> (lo [N,K/2] u8, hi [N,K/4] u8, s [N,K/32] f16), RTN g32. qmax < 31 fake-quantizes to fewer
+    bits in the same layout (quality probes)."""
     n, k = w.shape
     L = torch.empty((n, k // 2), dtype=torch.uint8, device=w.device)
     H = torch.empty((n, k // 4), dtype=torch.uint8, device=w.device)
     S = torch.empty((n, k // 32), dtype=torch.float16, device=w.device)
     for a in range(0, n, 2048):
         f = w[a:a + 2048].float().view(-1, k // 32, 32)
-        s = (f.abs().amax(-1, keepdim=True) / 31.0).to(torch.float16).float().clamp_min(6.2e-5)
-        q = (torch.round(f / s).clamp(-32, 31).to(torch.int32) + 32).view(-1, k)
+        s = (f.abs().amax(-1, keepdim=True) / qmax).to(torch.float16).float().clamp_min(6.2e-5)
+        q = (torch.round(f / s).clamp(-qmax - 1, qmax).to(torch.int32) + 32).view(-1, k)
         lo = q & 15; hi = q >> 4
         L[a:a + 2048] = (lo[:, 0::2] | (lo[:, 1::2] << 4)).to(torch.uint8)
         H[a:a + 2048] = (hi[:, 0::4] | (hi[:, 2::4] << 2) | (hi[:, 1::4] << 4) | (hi[:, 3::4] << 6)).to(torch.uint8)
@@ -239,7 +240,8 @@ def quantize_nv4(w, rows=2048):
 # --- INT2 coarse head (from E46 exp_head2.py) ---
 @triton.jit
 def _int2_head(X, W, S, O, RS, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-               XM: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ROW_SCALE: tl.constexpr):
+               XM: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ROW_SCALE: tl.constexpr,
+               G: tl.constexpr = 16):
     # S: per-16 group scales (fp16, or e4m3 relative to the fp32 per-row scale RS when ROW_SCALE)
     pid = tl.program_id(0)
     rn = pid * BN + tl.arange(0, BN)
@@ -251,26 +253,26 @@ def _int2_head(X, W, S, O, RS, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr
         rkq = k0 // 4 + tl.arange(0, BK // 4)
         p = tl.load(W + rn[:, None] * (K // 4) + rkq[None, :], (rn[:, None] < N), other=0)
         w = tl.reshape(tl.join(tl.join(p & 3, (p >> 2) & 3), tl.join((p >> 4) & 3, p >> 6)), (BN, BK)).to(tl.float32) - 1.5
-        rg = k0 // 16 + tl.arange(0, BK // 16)
-        s = tl.load(S + rn[:, None] * (K // 16) + rg[None, :], (rn[:, None] < N), other=0.0).to(tl.float32)
-        w = tl.reshape(tl.reshape(w, (BN, BK // 16, 16)) * s[:, :, None], (BN, BK))
+        rg = k0 // G + tl.arange(0, BK // G)
+        s = tl.load(S + rn[:, None] * (K // G) + rg[None, :], (rn[:, None] < N), other=0.0).to(tl.float32)
+        w = tl.reshape(tl.reshape(w, (BN, BK // G, G)) * s[:, :, None], (BN, BK))
         acc += tl.dot(x, tl.trans(w.to(tl.bfloat16)), out_dtype=tl.float32)
     if ROW_SCALE:
         acc = acc * tl.load(RS + rn, rn < N, other=0.0)[None, :]
-    tl.store(O + rm[:, None] * N + rn[None, :], acc, (rm[:, None] < M) & (rn[None, :] < N))
+    tl.store(O + rm[:, None] * N + rn[None, :], acc.to(O.dtype.element_ty), (rm[:, None] < M) & (rn[None, :] < N))
 
 # kernel element order within one byte after join/reshape: [b0-1, b4-5, b2-3, b6-7]
 ORDER = (0, 2, 1, 3)   # element j of each 4-group lives in bit-pair ORDER[j]
 
 @torch.no_grad()
-def quantize_int2(weight: torch.Tensor, scale_fmt: str = "fp16"):
-    """INT2 g16 (levels -1.5..1.5 x s). scale_fmt fp16 -> (packed, s); e4m3 -> (packed, s_e4m3, row_scale_fp32)."""
+def quantize_int2(weight: torch.Tensor, scale_fmt: str = "fp16", group: int = 16):
+    """INT2 per-group (levels -1.5..1.5 x s). scale_fmt fp16 -> (packed, s); e4m3 -> (packed, s_e4m3, row_scale_fp32)."""
     n, k = weight.shape
     packed = torch.empty((n, k // 4), dtype=torch.uint8, device=weight.device)
-    scales = torch.empty((n, k // 16), dtype=torch.float16 if scale_fmt == "fp16" else torch.float8_e4m3fn, device=weight.device)
+    scales = torch.empty((n, k // group), dtype=torch.float16 if scale_fmt == "fp16" else torch.float8_e4m3fn, device=weight.device)
     rows = torch.empty((n,), dtype=torch.float32, device=weight.device)
     for a in range(0, n, 8192):
-        f = weight[a:a + 8192].float().view(-1, k // 16, 16)
+        f = weight[a:a + 8192].float().view(-1, k // group, group)
         s = f.abs().amax(-1, keepdim=True).clamp_min(1e-8) / 1.5
         if scale_fmt == "fp16":
             s = s.half(); sf = s.float()
@@ -288,13 +290,14 @@ def quantize_int2(weight: torch.Tensor, scale_fmt: str = "fp16"):
 def dequant_int2(packed, scales):
     n = packed.shape[0]; k = packed.shape[1] * 4
     idx = torch.stack([(packed >> (2 * ORDER[j])) & 3 for j in range(4)], -1).view(n, k).float() - 1.5
-    return (idx.view(n, k // 16, 16) * scales.float()[..., None]).view(n, k)
+    g = k // scales.shape[1]
+    return (idx.view(n, k // g, g) * scales.float()[..., None]).view(n, k)
 
-def int2_logits(x, P, S, N, BN=64, BK=512, nw=4, RS=None):
+def int2_logits(x, P, S, N, BN=64, BK=512, nw=4, RS=None, out_dtype=torch.float32):
     x = x.to(torch.bfloat16).contiguous(); m, k = x.shape
-    out = torch.empty((m, N), dtype=torch.float32, device=x.device)
+    out = torch.empty((m, N), dtype=out_dtype, device=x.device)
     _int2_head[(triton.cdiv(N, BN),)](x, P, S, out, out if RS is None else RS, m, N, k, x.stride(0),
-                                      max(16, triton.next_power_of_2(m)), BN, BK, RS is not None, num_warps=nw)
+                                      max(16, triton.next_power_of_2(m)), BN, BK, RS is not None, k // S.shape[1], num_warps=nw)
     return out
 
 
