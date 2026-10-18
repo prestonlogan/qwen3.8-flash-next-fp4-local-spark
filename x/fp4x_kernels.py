@@ -284,3 +284,103 @@ def int2_logits(x, P, S, N, BN=64, BK=256, nw=4):
     out = torch.empty((m, N), dtype=torch.float32, device=x.device)
     _int2_head[(triton.cdiv(N, BN),)](x, P, S, out, m, N, k, x.stride(0), max(16, triton.next_power_of_2(m)), BN, BK, num_warps=nw)
     return out
+
+
+# --- Fused hyper-connection mixer kernels (decode, M <= 16, W8 weights):
+#   hc_down: split-K W8 GEMV whose last CTA per column tile casts the fp32 sum to BF16 (down/injection output)
+#            and applies the bottleneck activation silu(bf16(x / HC)) in its epilogue; replaces
+#            zero-fill + GEMV + cast + scaled_silu.
+#   hc_up:   W8 GEMV over stream-interleaved up rows whose epilogue applies the sigmoid gate and the stream
+#            mean against the normalized input; replaces GEMV + gate_mean.
+# Rounding points follow b12x's _ScaledSilu / _GateMean kernels.
+
+
+@triton.jit
+def _hc_down(X, W, S, ACC, CNT, DI, BOT, M, XS, N: tl.constexpr, K: tl.constexpr, LR: tl.constexpr,
+             HC: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, KSPLIT: tl.constexpr):
+    pid_n = tl.program_id(0); pid_k = tl.program_id(1)
+    rn = pid_n * BN + tl.arange(0, BN); rm = tl.arange(0, BM)
+    acc = tl.zeros((BM, BN), tl.float32)
+    k_per: tl.constexpr = K // KSPLIT
+    k_lo = pid_k * k_per
+    for k0 in tl.range(k_lo, k_lo + k_per, BK, num_stages=3):
+        rk = k0 + tl.arange(0, BK)
+        x = tl.load(X + rm[:, None] * XS + rk[None, :], rm[:, None] < M, other=0.0)
+        w = tl.load(W + rn[:, None] * K + rk[None, :], rn[:, None] < N, other=0).to(tl.float32)
+        rg = k0 // 64 + tl.arange(0, BK // 64)
+        s = tl.load(S + rn[:, None] * (K // 64) + rg[None, :], rn[:, None] < N, other=0.0)
+        w = tl.reshape(tl.reshape(w, (BN, BK // 64, 64)) * s[:, :, None], (BN, BK)).to(tl.bfloat16)
+        acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
+    msk = (rm[:, None] < M) & (rn[None, :] < N)
+    aptr = ACC + rm[:, None] * N + rn[None, :]
+    tl.atomic_add(aptr, acc, msk, sem="relaxed")
+    tl.debug_barrier()
+    old = tl.atomic_add(CNT + pid_n, 1, sem="acq_rel")
+    if old == KSPLIT - 1:
+        tot = tl.load(aptr, msk, other=0.0, cache_modifier=".cg")
+        v = tot.to(tl.bfloat16)
+        tl.store(DI + rm[:, None] * N + rn[None, :], v, msk)
+        sc = (v.to(tl.float32) / HC).to(tl.bfloat16).to(tl.float32)
+        tl.store(BOT + rm[:, None] * LR + rn[None, :], (sc * tl.sigmoid(sc)).to(tl.bfloat16), msk & (rn[None, :] < LR))
+        tl.store(aptr, tl.zeros((BM, BN), tl.float32), msk)
+        tl.debug_barrier()
+        tl.atomic_xchg(CNT + pid_n, 0, sem="relaxed")
+
+
+@triton.jit
+def _hc_up(X, W, S, NRM, O, M, XS, NS, K: tl.constexpr, H: tl.constexpr, HC: tl.constexpr,
+           BM: tl.constexpr, BJ: tl.constexpr, BK: tl.constexpr):
+    # W rows are stream-interleaved: tile j covers rows [s * H + j * BJ + t] for s < HC, t < BJ, stored contiguously.
+    BN: tl.constexpr = HC * BJ
+    pid = tl.program_id(0)
+    rr = pid * BN + tl.arange(0, BN); rm = tl.arange(0, BM)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in tl.range(0, K, BK, num_stages=3):
+        rk = k0 + tl.arange(0, BK)
+        x = tl.load(X + rm[:, None] * XS + rk[None, :], rm[:, None] < M, other=0.0)
+        w = tl.load(W + rr[:, None] * K + rk[None, :]).to(tl.float32)
+        rg = k0 // 64 + tl.arange(0, BK // 64)
+        s = tl.load(S + rr[:, None] * (K // 64) + rg[None, :])
+        w = tl.reshape(tl.reshape(w, (BN, BK // 64, 64)) * s[:, :, None], (BN, BK)).to(tl.bfloat16)
+        acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
+    g = tl.reshape(acc.to(tl.bfloat16).to(tl.float32), (BM, HC, BJ))
+    gate = tl.sigmoid(g).to(tl.bfloat16).to(tl.float32)
+    rs = tl.arange(0, HC); rj = pid * BJ + tl.arange(0, BJ)
+    col = rs[:, None] * H + rj[None, :]
+    mm = (rm < M)[:, None, None]
+    val = tl.load(NRM + rm[:, None, None] * NS + col[None, :, :], mm, other=0.0).to(tl.float32)
+    tot = tl.sum((val * gate).to(tl.bfloat16).to(tl.float32), axis=1)
+    tl.store(O + rm[:, None] * H + rj[None, :], (tot / HC).to(tl.bfloat16), (rm < M)[:, None])
+
+
+class HCFused:
+    """Per-process scratch (one split-K accumulator + tile counters shared by every mixer: calls are stream-ordered)."""
+
+    def __init__(self, device, n_down=336, max_m=16, bn=32):
+        self.acc = torch.zeros((max_m, n_down), dtype=torch.float32, device=device)
+        self.cnt = torch.zeros((triton.cdiv(n_down, bn),), dtype=torch.int32, device=device)
+
+    def down(self, x, q, s, lr, hc, cfg=(32, 512, 4, 4)):
+        BN, BK, KS, nw = cfg
+        m, k = x.shape; n = q.shape[0]
+        di = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+        bot = torch.empty((m, lr), dtype=torch.bfloat16, device=x.device)
+        _hc_down[(triton.cdiv(n, BN), KS)](x, q, s, self.acc, self.cnt, di, bot, m, x.stride(0), N=n, K=k, LR=lr, HC=hc,
+                                           BM=16, BN=BN, BK=BK, KSPLIT=KS, num_warps=nw)
+        return di, bot
+
+    @staticmethod
+    def interleave_up(q, s, hc, bj):
+        """Reorder up-projection rows [HC*H, K] so each BJ-column tile holds its HC stream rows contiguously."""
+        n, k = q.shape; h = n // hc
+        idx = torch.arange(n, device=q.device).view(hc, h // bj, bj).permute(1, 0, 2).reshape(-1)
+        return q[idx].contiguous(), s[idx].contiguous()
+
+    @staticmethod
+    def up(bot, qi, si, normalized, hc, cfg=(8, 64, 8)):
+        BJ, BK, nw = cfg
+        m, k = bot.shape; n = qi.shape[0]; h = n // hc
+        out = torch.empty((m, h), dtype=torch.bfloat16, device=bot.device)
+        _hc_up[(h // BJ,)](bot, qi, si, normalized, out, m, bot.stride(0), normalized.stride(0), K=k, H=h, HC=hc,
+                           BM=16, BJ=BJ, BK=BK, num_warps=nw)
+        return out

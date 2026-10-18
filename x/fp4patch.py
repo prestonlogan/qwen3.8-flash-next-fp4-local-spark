@@ -4,6 +4,7 @@
 #   FP4X_MX8=1   MXFP8 dense linears (M <= FP4X_MX8_MAXM rows) read b12x's packed fp8 rows + e8m0 scale rows
 #                exactly and run a bandwidth-tuned Triton GEMV instead of the b12x block-scaled GEMM.
 #   FP4X_HC=1    hyper-connection down/inject and up BF16 projections through a Triton BF16 GEMV (M <= 16).
+#   FP4X_HC_FUSED=1 (with FP4X_HC_W8=1) each mixer as two fused kernels (fp4x_kernels.HCFused), same rounding points.
 # Both are exact-weight paths (fp32 accumulation; only the summation order differs).
 import os, sys
 
@@ -15,9 +16,9 @@ CFG_MX8 = {  # (N, K): (BN, BK, KSPLIT, warps), tuned at M=4/8 on GB10 with L2-c
 CFG_W6 = {(16384, 2560): (32, 256, 1, 4), (96, 2560): (16, 256, 2, 4), (13312, 2560): (16, 256, 1, 4),
           (640, 2560): (16, 256, 1, 2), (1280, 2560): (16, 256, 1, 2), (2560, 6144): (32, 256, 1, 4), (2560, 640): (32, 128, 1, 2)}
 CFG_NV4 = {}
-CFG_BG = {(336, 10240): (16, 512, 1, 4), (10240, 320): (32, 64, 1, 4)}
+CFG_BG = {(336, 10240): (16, 512, 1, 4), (10240, 320): (32, 64, 1, 4), (512, 2560): (16, 256, 1, 4)}
 CFG_HC_NV4 = {(336, 10240): (16, 128, 2, 20), (10240, 320): (32, 64, 4, 1)}
-CFG_W8 = {(336, 10240): (32, 512, 4, 4), (10240, 320): (32, 64, 1, 8)}
+CFG_W8 = {(336, 10240): (32, 512, 4, 4), (10240, 320): (32, 64, 1, 8), (512, 2560): (16, 512, 1, 4)}
 _stats = {"mx8": 0, "mx8_skip": 0}
 
 
@@ -139,12 +140,40 @@ def _patch_hc():
     direct_register_custom_op(op_name="fp4x_bf16_linear", op_func=_bg, fake_impl=_bg_fake)
     op = torch.ops.vllm.fp4x_bf16_linear
     orig = HC.GatedResidual._mix_normalized
+    fused = w8 and os.environ.get("FP4X_HC_FUSED") == "1"
+    fx = []
+    qu = {}
+
+    def _mix_fused(self, normalized):
+        # Two kernels per mixer (see fp4x_kernels.HCFused); bit-identical to the W8 GEMV + b12x silu / gate_mean path.
+        wd = (self.input_mix_weight_down_block_inject if self.use_combine else self.input_mix_weight_down).weight
+        wu = self.input_mix_weight_up.weight
+        kd, ku = (wd.data_ptr(), tuple(wd.shape)), (wu.data_ptr(), tuple(wu.shape))
+        if kd not in q8 or ku not in qu or not fx:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            if not fx:
+                fx.append(F.HCFused(normalized.device))
+            if kd not in q8:
+                q8[kd] = F.quantize_w8(wd)
+            if ku not in qu:
+                qu[ku] = F.HCFused.interleave_up(*F.quantize_w8(wu), self.hc_count, 8)
+                if len(qu) in (1, 97): _log(f"HC fused: prepared {len(qu)} mixers")
+        x = normalized.contiguous()
+        di, bot = fx[0].down(x, *q8[kd], self.lora_rank, self.hc_count, (32, 256, 8, 4))
+        block_input = F.HCFused.up(bot, *qu[ku], x, self.hc_count, (8, 64, 4))
+        injection = di[:, self.lora_rank : self.lora_rank + self.hc_count] if self.use_combine else None
+        return block_input, injection
 
     def _mix_normalized(self, normalized):
         if self.tp_size > 1:
             return orig(self, normalized)
         api = HC._hyperconnection_api() if self.workspace is not None else None
         aw = "mtp" not in (self._preparation_prefix or "") or os.environ.get("FP4X_HC_W8_MTP") == "1"
+        if fused and aw and normalized.shape[0] <= 16:
+            r = _mix_fused(self, normalized)
+            if r is not None:
+                return r
         if self.use_combine:
             down_and_injection = op(normalized, self.input_mix_weight_down_block_inject.weight, aw)
             projected_down = down_and_injection[:, : self.lora_rank]
@@ -165,18 +194,32 @@ def _patch_hc():
 
     HC.GatedResidual._mix_normalized = _mix_normalized
     _log("HC BF16 decode GEMV installed")
-    if os.environ.get("FP4X_MTP_W8") == "1":
+    mtp_w8 = os.environ.get("FP4X_MTP_W8") == "1"
+    gate_mode = os.environ.get("FP4X_GATE", "")  # target router gates: w8 (approx) | bf16 (exact weights)
+    if mtp_w8 or gate_mode:
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
         orig_apply = UnquantizedLinearMethod.apply
+        gate_calls = [0]
 
         def apply(self, layer, x, bias=None):
-            if bias is None and str(getattr(layer, "prefix", "")).startswith("mtp.") and layer.weight.dim() == 2:
-                x2 = x.reshape(-1, x.shape[-1])
-                return op(x2, layer.weight, True).view(*x.shape[:-1], layer.weight.shape[0])
+            if bias is None and layer.weight.dim() == 2:
+                prefix = str(getattr(layer, "prefix", ""))
+                if mtp_w8 and prefix.startswith("mtp."):
+                    x2 = x.reshape(-1, x.shape[-1])
+                    return op(x2, layer.weight, True).view(*x.shape[:-1], layer.weight.shape[0])
+                if gate_mode and prefix.endswith(".mlp.gate") and x.reshape(-1, x.shape[-1]).shape[0] <= 16:
+                    x2 = x.reshape(-1, x.shape[-1]).contiguous()
+                    gate_calls[0] += 1
+                    if gate_calls[0] in (1, 1000): _log(f"router gate {gate_mode} call #{gate_calls[0]} {prefix} x={tuple(x2.shape)}")
+                    if gate_mode == "w8":
+                        y = op(x2, layer.weight, True)
+                    else:
+                        y = F.bf16_linear(x2, layer.weight, CFG_BG.get(tuple(layer.weight.shape)) or (16, 256, 1, 4))
+                    return y.view(*x.shape[:-1], layer.weight.shape[0])
             return orig_apply(self, layer, x, bias)
 
         UnquantizedLinearMethod.apply = apply
-        _log("MTP BF16 linears -> W8 decode GEMV")
+        _log(f"UnquantizedLinear decode hook: mtp_w8={mtp_w8} gate={gate_mode or 'off'}")
 
 
 def _patch_draft_vocab():
@@ -357,7 +400,54 @@ def _patch_mtp_weights():
     _log(f"MTP weight patch installed ({path})")
 
 
+def _patch_moe_tau():
+    # Quality-gated experiment: at decode shapes (M <= 16) drop routed experts whose normalized router weight is below
+    # FP4X_MOE_TAU by pointing them at the token's top-1 expert with weight 0 (no extra expert weights are read).
+    # FP4X_MOE_RENORM=1 renormalizes the kept weights to sum 1.
+    import torch
+    from vllm.model_executor.layers.fused_moe import b12x as B
+    tau = float(os.environ["FP4X_MOE_TAU"]); renorm = os.environ.get("FP4X_MOE_RENORM") == "1"
+    orig = B.B12xExperts.apply
+
+    def apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids, *a, **k):
+        if hidden_states.shape[0] <= 16:
+            w = topk_weights.float()
+            top = w.argmax(1, keepdim=True)
+            keep = (w >= tau).scatter(1, top, True)
+            topk_ids = torch.where(keep, topk_ids, topk_ids.gather(1, top)).contiguous()
+            w = torch.where(keep, w, torch.zeros_like(w))
+            if renorm:
+                w = w / w.sum(1, keepdim=True)
+            topk_weights = w.contiguous()
+        return orig(self, output, hidden_states, w1, w2, topk_weights, topk_ids, *a, **k)
+
+    B.B12xExperts.apply = apply
+    _log(f"MoE decode expert drop installed (tau={tau}, renorm={renorm})")
+
+
+def _patch_moe_zero():
+    # Debug ablation: routed-expert output = 0 at decode shapes (measures the routed MoE share of a step; garbage output).
+    from vllm.model_executor.layers.fused_moe import b12x as B
+    orig = B.B12xExperts.apply
+
+    def apply(self, output, hidden_states, *a, **k):
+        if hidden_states.shape[0] <= 16:
+            output.zero_()
+            return None
+        return orig(self, output, hidden_states, *a, **k)
+
+    B.B12xExperts.apply = apply
+    _log("MoE decode ZERO ablation installed")
+
+
 def register():
+    if os.environ.get("FP4X_MOE_ZERO") == "1":
+        _patch_moe_zero()
+    if os.environ.get("FP4X_MOE_TAU"):
+        try:
+            _patch_moe_tau()
+        except Exception as e:
+            _log(f"MoE tau patch failed: {type(e).__name__}: {e}")
     if os.environ.get("FP4X_MTP_PATCH"):
         try:
             _patch_mtp_weights()

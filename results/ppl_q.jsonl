@@ -6,3 +6,10 @@
 {"tag": "Q_w6_qkvz_nv4", "tokens": 9588, "ppl": 2.6339}
 {"tag": "Q_w6_out_nv4", "tokens": 9588, "ppl": 2.7696}
 {"tag": "Q_nv4qkv", "tokens": 9588, "ppl": 2.6438}
+{"tag": "Q_tau05r", "tokens": 9588, "ppl": 2.6623}
+{"tag": "Q_tau07r", "tokens": 9588, "ppl": 2.8228}
+{"tag": "Q_base_fh", "tokens": 9588, "ppl": 2.6322}
+{"tag": "Q_gatew8", "tokens": 9588, "ppl": 2.6332}
+{"tag": "Q_hcfused_gatew8", "tokens": 9588, "ppl": 2.6396}
+{"tag": "Q_hcfused_gatew8_r2", "tokens": 9588, "ppl": 2.6262}
+{"tag": "Q_gatew8_r2", "tokens": 9588, "ppl": 2.637}

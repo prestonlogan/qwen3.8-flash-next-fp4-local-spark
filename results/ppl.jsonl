@@ -24,3 +24,8 @@
 {"tag": "E20b_adapt", "tokens": 9588, "ppl": 2.6572}
 {"tag": "E21_r32a", "tokens": 9588, "ppl": 2.6572}
 {"tag": "E22_r32a_s3", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E23_compile", "tokens": 9588, "ppl": 2.6479}
+{"tag": "E24_hcw8mtp", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E25_pdl", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E26_gatew8", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E27_hcfused", "tokens": 9588, "ppl": 2.6572}

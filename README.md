@@ -1,4 +1,4 @@
-# Qwen3.8-Flash-Next-FP4-Local on one DGX Spark: ~53 tok/s prose
+# Qwen3.8-Flash-Next-FP4-Local on one DGX Spark: ~55 tok/s prose
 
 This is a single-Spark serving recipe for [`nvidia/Qwen3.8-Flash-Next-FP4-Local`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local), NVIDIA's QAD-trained FP4 checkpoint. It adds a small vLLM plugin (`x/fp4patch.py` plus Triton kernels in `x/fp4x_kernels.py`) that speeds up the per-token decode path on GB10.
 
@@ -12,14 +12,14 @@ All numbers are tok/s, decode only, 400-token completions, one stream unless not
 
 | | Model card recipe | + 3 MTP drafts + async scheduling | **This repo** |
 |---|---|---|---|
-| Prose, greedy | 36.7 | 39.9 | **52.7 – 53.1** |
-| Prose, sampled (T=1.0, top-p 0.95, top-k 20) | – | 36.7 | **50.9** |
-| Code / JSON, greedy | 59 – 61 | 60 / 58 | 69 / 65 – 69 |
-| Prose at 110k-token context | – | 40.8 | **49.9** |
+| Prose, greedy | 36.7 | 39.9 | **54.4 – 55.3** |
+| Prose, sampled (T=1.0, top-p 0.95, top-k 20) | – | 36.7 | **51.3** |
+| Code / JSON, greedy | 59 – 61 | 60 / 58 | 71 – 72 / 68 |
+| Prose at 110k-token context | – | 40.8 | **54.3** |
 | Aggregate at 2 / 4 streams | 51 / 68 | 58 / 75 | **74 / 98** (before r32a) |
-| ms per decode step | 64 | 58 | **40.4** |
+| ms per decode step | 64 | 58 | **39.4** |
 
-**Quality.** Decode-path perplexity is measured with prompts forced through the M≤16 kernels (`exp_q.sh`), over 12 texts and 9,588 tokens. It is **2.634** here vs **2.650** for the card recipe. The stock b12x path quantizes activations at small M, and the exact MXFP8 GEMV here wins back more than the 6-bit and NVFP4 weight copies lose.
+**Quality.** Decode-path perplexity is measured with prompts forced through the M≤16 kernels (`exp_q.sh`), over 12 texts and 9,588 tokens. It is **2.633** here (mean of two runs) vs **2.650** for the card recipe. The stock b12x path quantizes activations at small M, and the exact MXFP8 GEMV here wins back more than the 6-bit and NVFP4 weight copies lose.
 
 Functional gates (`gates.py`) all pass: single and multi-turn tool calls, strict JSON, schema-guided JSON, 4/4 reasoning with thinking on, and a code-execution test.
 
@@ -58,13 +58,29 @@ nohup ./watchdog.sh >/dev/null 2>&1 &   # optional: kills the container if MemAv
 | `FP4X_DENSE=w6` | 6-bit g32 copies of the dense weights (GDN/QSA projections, shared experts). | quality-gated (PPL 2.631) | ~2 ms |
 | `FP4X_NV4_SHAPES=16384x2560` | GDN `in_proj_qkvz` as NVFP4. | quality-gated (PPL 2.634) | ~1 ms |
 | `FP4X_HC=1 FP4X_HC_W8=1` | Hyper-connection mixer matmuls (97 target layers) as int8 g64. Was cuBLAS BF16. | quality-gated (PPL 2.635) | ~2.4 ms |
+| `FP4X_HC_FUSED=1` | Each W8 mixer as two kernels instead of six: a split-K down projection whose last CTA per tile casts, applies the bottleneck SiLU and re-zeroes its accumulator, and an up projection over stream-interleaved rows whose epilogue does the sigmoid gate and stream mean. | exact (bit-identical to the W8 path) | ~0.7 ms |
+| `FP4X_GATE=w8` | MoE router gates (48 × 512×2560 BF16) as int8 g64. | quality-gated (PPL +0.04%) | ~0.25 ms |
 | `FP4X_MTP_W8=1` | MTP layer BF16 linears as int8 g64. | draft only | ~1 ms |
 | `FP4X_DRAFT_VOCAB=dv65k.txt` | MTP draft head over a 65k-token NVFP4 subset instead of 248k. | draft only | ~2.5 ms |
 | `FP4X_MTP_PATCH=…/mtp_patch_r32a.safetensors` | Self-distilled MTP drafter weights, applied right after load (see below). | draft only | tok/step +4.5% |
 | `FP4X_FAST_HEAD=1` | Target LM head: INT2 coarse pass, then exact MXFP8 rescoring of the top 512. A self-check runs at build time. | top-512 exact (argmax agree 1.000) | ~1 ms |
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Removes a post-load dip in MemAvailable, to about 1.5 GiB, that could OOM the box. | – | stability |
 
-Where the time goes now, per 40.4 ms step: about 33 ms in the verify CUDA graph (MoE experts are the largest part), about 5.5 ms for logits, sampling and the 2 draft steps, and about 1 ms of disk n-gram (PLE) reads.
+Where the time goes now, per 39.4 ms step (CUDA-event spans and graph-timed components at M=3, `x/probes/probe_*.py`):
+
+| Part | ms | Floor at 243 GB/s |
+|---|---|---|
+| Verify graph | ~34 | |
+| ‣ routed + shared MoE (b12x W4A16, ~21 unique experts per 3-token step) | ~15 | ~12.4 |
+| ‣ dense linears (W6 / NVFP4 Triton GEMVs, 240 calls) | ~10.5 | 8.3 |
+| ‣ hyper-connection mixers (97 × 2 fused kernels) | ~3.4 | 2.7 |
+| ‣ router gates (W8) | ~0.45 | 0.26 |
+| ‣ GDN / QSA attention, norms, combines, PLE add | ~4.5 | – |
+| 2 draft steps (`propose`) | ~3.0 | |
+| Target LM head (fast head) | ~1.7 | |
+| Disk PLE read gap before the graph | ~0.7 | |
+
+The big kernels already run at 75–90% of DRAM bandwidth; what's left is mostly per-kernel latency in long chains of small launches.
 
 ## Experiment log
 
@@ -96,10 +112,20 @@ Greedy prose2 tok/s, ms/step, and tokens per step. Raw JSONL is in `results/`.
 | **E21** | **E18 + r32a drafter (shipped)** | **52.7** | **40.5** | 2.14 | 68.9 |
 | E22 | E21 with 3 drafts | 51.7 | 46.4 | 2.40 | 75.5 |
 | SHIP | shipped `serve.sh` defaults | 53.1 | 40.4 | 2.15 | 69.2 |
+| E23 | `torch.compile` (inductor) on the drafter path | 51.3 | 42.0 | 2.16 | 65.6 |
+| E24 | + HC W8 on the MTP mixers | 53.5 | 40.3 | 2.16 | 69.3 |
+| E25 | + PDL launches for every plugin GEMV | 54.0 | 40.6 | 2.19 | 69.3 |
+| E26 | + router gates W8 | 52.9 | 40.1 | 2.12 | 70.7 |
+| **E27** | **E26 + fused HC mixers (shipped)** | **54.4** | **39.4** | 2.14 | 71.1 |
+| SHIP2 | shipped `serve.sh` defaults | 55.3 | 39.45 | 2.18 | 71.6 |
 
-Sampled prose: E15 47.4, E18 50.8, E20b 48.6, **E21 50.9**, E22 48.8.
+Sampled prose: E15 47.4, E18 50.8, E20b 48.6, **E21 50.9**, E22 48.8, E24 50.7, E25 50.5, E26 50.8, **E27 51.3**, SHIP2 51.3.
+
+Greedy tok/step moves by ±0.03 between identical runs because the drafts are sampled, so ms/step is the cleaner signal for step-cost changes.
 
 Decode-path PPL (`results/ppl_q.jsonl`):
+
+Repeated runs of the same config differ by up to ±0.007 (about ±0.25%), because the split-K GEMVs accumulate with atomics and the summation order changes from run to run. Treat single readings near the +0.3% budget as inconclusive and repeat them.
 
 | Config | PPL |
 |---|---|
@@ -108,9 +134,14 @@ Decode-path PPL (`results/ppl_q.jsonl`):
 | + HC W8 | 2.6350 |
 | + W6 | 2.6312 |
 | + qkvz NV4 (shipped) | 2.6339 |
+| + fast head | 2.6322 |
+| + router gates W8 | 2.6332, 2.6370 |
+| + fused HC mixers (shipped) | 2.6396, 2.6262 |
 | + qkv NV4 | 2.6438 |
 | out_proj NV4 | 2.7696 |
 | all-dense NV4 | 2.7903 |
+| drop routed experts with weight < 0.05 (renormalized) | 2.6623 |
+| drop routed experts with weight < 0.07 (renormalized) | 2.8228 |
 
 ## Drafter self-distillation (r32a)
 
@@ -135,6 +166,13 @@ The FP4-Local MTP drafter, LM head and embeddings are **bit-identical** to the p
 - **Retraining the drafter** on FP4-Local's own greedy outputs: no better than r32a (see above).
 - **3 drafts with r32a**: 51.7 greedy / 48.8 sampled, vs 52.7 / 50.9 with 2 drafts. Code/JSON improve to 75/72.
 - **RAM PLE** (`VLLM_PLE_TABLE_MEMORY=ram`). The 28.8 GB table counts against the GPU memory budget and doesn't fit next to the KV cache.
+- **`torch.compile`** (E23). The FULL verify graph runs with compile mode NONE (b12x's breakable graphs force it), so only the drafter got compiled. Prose 51.3, slower than eager.
+- **Skipping low-weight routed experts** at decode (`FP4X_MOE_TAU`, debug flag in `fp4patch.py`). The top-10 routing weights are flat (mean sorted weights 0.205 … 0.058), so dropping even the weakest costs PPL +1.1% (τ=0.05) or +7% (τ=0.07).
+- **Programmatic dependent launch** for the plugin's GEMVs (E25). A chain of PDL GEMVs saves about 2 µs per kernel in isolation, but in the model most neighbours are b12x/torch kernels that never trigger early, so step time didn't move.
+- **W6 hyper-connection mixers.** The mixer GEMVs (336×10240, 10240×320) are latency-bound at 17–21 µs; 6-bit weights were no faster than int8 and have 3× the error.
+- **Semaphore split-K for the W6 dense GEMVs.** No gain for any dense shape (out_proj stays near 190 GB/s); split-K only pays off for the 11-tile mixer down projection.
+- **b12x small-M MoE knobs** (`B12X_W4A16_SMALL_M_OCCUPANCY=2`, `B12X_W4A16_SMALL_M_SPLITK=1`): within ±2% on the 48-layer MoE graph. On real routing b12x already reaches ~85–90% of bandwidth, which caps a custom W4A16 decode kernel at roughly 1–1.5 ms.
+- **HC W8 on the MTP mixers** (E24): neutral (−0.1 ms/step).
 - **Torch profiler.** One profiler run was followed by a hard reset of the Spark on the next reload. Use CUDA-event spans instead (`x/probes/probe16*.py`).
 
 ## Layout
@@ -142,8 +180,9 @@ The FP4-Local MTP drafter, LM head and embeddings are **bit-identical** to the p
 ```
 serve.sh              launcher (FP4_OPT=1 optimized, 0 = card recipe)
 watchdog.sh           MemAvailable guard
-x/fp4patch.py         vLLM plugin (patches above; also unused FP4X_PLE_QD / FP4X_PLE_SPIN / FP4X_HC_NV4)
-x/fp4x_kernels.py     Triton GEMVs: mx8, bf16, w8, w6, nv4, int2 logits + quantizers
+x/fp4patch.py         vLLM plugin (patches above; also unused FP4X_PLE_QD / FP4X_PLE_SPIN / FP4X_HC_NV4 and the
+                      debug ablations FP4X_MOE_TAU / FP4X_MOE_ZERO / FP4X_HC_ZERO / FP4X_MX8_ZERO)
+x/fp4x_kernels.py     Triton GEMVs: mx8, bf16, w8, w6, nv4, int2 logits + quantizers; HCFused mixer kernels
 x/fp4patch-0.1.dist-info/   entry point registration
 x/dv65k.txt           draft-vocab token ids (64,877 + tail)
 x/fp4ext.py, x/rpc.py worker extension + /collective_rpc client for in-process probes (dev mode only)
@@ -153,6 +192,8 @@ adapters/r32a/        drafter LoRA (from the companion repo); t8/build_patch.sh 
 t8/                   drafter self-distillation pipeline (corpus, capture, train, merge)
 ab_swap.sh            same-process A/B of a hot-swapped drafter patch
 exp.sh, exp_q.sh      restart-and-benchmark / decode-path-PPL harnesses
+run_ship.sh           validate serve.sh defaults: bench, gates, 110k context
+spans.sh, abl.sh      CUDA-event step accounting on the dev server; ablation sequences
 q38bench.py, ppl.py, gates.py, t8_long.py, summ.py   benchmarks
 results/              raw JSONL for every run above
 gateway/              llama-swap adapter

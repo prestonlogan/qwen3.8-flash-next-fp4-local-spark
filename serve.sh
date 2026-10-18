@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # NVIDIA Qwen3.8-Flash-Next-FP4-Local on one DGX Spark (model-card Spark recipe, run detached).
-# Default (FP4_OPT=1): fp4x decode plugin (x/fp4patch.py) + r32a drafter + 2 MTP drafts, ~52.7 tok/s greedy prose
+# Default (FP4_OPT=1): fp4x decode plugin (x/fp4patch.py) + r32a drafter + 2 MTP drafts, ~55 tok/s greedy prose
 # (card recipe ~36.7). FP4_OPT=0: card recipe + 3 MTP drafts + --async-scheduling (~39.9).
 # fp4x patches (M<=16 decode path only; prefill untouched):
 #   FP4X_MX8      exact MXFP8 GEMV for dense linears (b12x quantizes activations at small M)
 #   FP4X_DENSE=w6 6-bit g32 copies of dense weights; FP4X_NV4_SHAPES: GDN in_proj_qkvz as NVFP4
 #   FP4X_HC/_W8   hyper-connection mixers as int8 g64 GEMV (target only; MTP keeps BF16)
+#   FP4X_HC_FUSED each mixer as two fused kernels (split-K down + silu epilogue, up + gate-mean epilogue; bit-exact)
+#   FP4X_GATE=w8  MoE router gates as int8 g64 GEMV (decode PPL +0.04%)
 #   FP4X_MTP_W8   MTP layer dense weights int8 g64 (draft only)
 #   FP4X_DRAFT_VOCAB  MTP draft head over a 65k-token NVFP4 subset (draft only)
 #   FP4X_FAST_HEAD    INT2 coarse LM head + exact MXFP8 rescoring of the top 512 (argmax exact)
 #   FP4X_MTP_PATCH    r32a self-distilled drafter weights (t8/build_patch.sh; draft only, +4% prose)
-# Decode-path PPL (12 texts): card 2.6501, optimized 2.6339 (exact MXFP8 more than offsets W6/NV4).
+# Decode-path PPL (12 texts): card 2.6501, optimized ~2.633 (exact MXFP8 more than offsets W6/NV4/W8).
 # usage: serve.sh [port] [extra vllm args...]
 set -euo pipefail
 PORT="${1:-5810}"; shift || true
@@ -27,7 +29,7 @@ if [ "${FP4_OPT:-1}" = 1 ]; then
     -v $X/fp4patch-0.1.dist-info:$SITE/fp4patch-0.1.dist-info:ro -v $X/dv65k.txt:/opt/fp4x/dv65k.txt:ro
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     -e FP4X_MX8=1 -e FP4X_DENSE=w6 -e FP4X_NV4_SHAPES=16384x2560
-    -e FP4X_HC=1 -e FP4X_HC_W8=1 -e FP4X_MTP_W8=1
+    -e FP4X_HC=1 -e FP4X_HC_W8=1 -e FP4X_HC_FUSED=1 -e FP4X_MTP_W8=1 -e FP4X_GATE=w8
     -e FP4X_DRAFT_VOCAB=/opt/fp4x/dv65k.txt -e FP4X_FAST_HEAD=1
   )
   if [ -f $X/mtp_patch_r32a.safetensors ]; then
