@@ -12,12 +12,12 @@ All numbers are tok/s, decode only, 400-token completions, one stream unless not
 
 | | Model card recipe | + 3 MTP drafts + async scheduling | **This repo** |
 |---|---|---|---|
-| Prose, greedy | 36.7 | 39.9 | **54.4 – 55.3** |
-| Prose, sampled (T=1.0, top-p 0.95, top-k 20) | – | 36.7 | **51.3** |
-| Code / JSON, greedy | 59 – 61 | 60 / 58 | 71 – 72 / 68 |
-| Prose at 110k-token context | – | 40.8 | **54.3** |
+| Prose, greedy | 36.7 | 39.9 | **55.0 – 55.6** |
+| Prose, sampled (T=1.0, top-p 0.95, top-k 20) | – | 36.7 | **53.4 – 54.4** |
+| Code / JSON, greedy | 59 – 61 | 60 / 58 | 71 – 73 / 69 – 70 |
+| Prose at 110k-token context | – | 40.8 | **51.5 – 54.3** |
 | Aggregate at 2 / 4 streams | 51 / 68 | 58 / 75 | **74 / 98** (before r32a) |
-| ms per decode step | 64 | 58 | **39.4** |
+| ms per decode step | 64 | 58 | **38.8** |
 
 **Quality.** Decode-path perplexity is measured with prompts forced through the M≤16 kernels (`exp_q.sh`), over 12 texts and 9,588 tokens. It is **2.633** here (mean of two runs) vs **2.650** for the card recipe. The stock b12x path quantizes activations at small M, and the exact MXFP8 GEMV here wins back more than the 6-bit and NVFP4 weight copies lose.
 
@@ -63,10 +63,11 @@ nohup ./watchdog.sh >/dev/null 2>&1 &   # optional: kills the container if MemAv
 | `FP4X_MTP_W8=1` | MTP layer BF16 linears as int8 g64. | draft only | ~1 ms |
 | `FP4X_DRAFT_VOCAB=dv65k.txt` | MTP draft head over a 65k-token NVFP4 subset instead of 248k. | draft only | ~2.5 ms |
 | `FP4X_MTP_PATCH=…/mtp_patch_r32a.safetensors` | Self-distilled MTP drafter weights, applied right after load (see below). | draft only | tok/step +4.5% |
-| `FP4X_FAST_HEAD=1` | Target LM head: INT2 coarse pass, then exact MXFP8 rescoring of the top 512. A self-check runs at build time. | top-512 exact (argmax agree 1.000) | ~1 ms |
+| `FP4X_FAST_HEAD=1` | Target LM head: INT2 coarse pass (BK 512, at DRAM bandwidth), then one fused kernel rescoring the top 512 exactly from the MXFP8 rows. A self-check runs at build time. | top-512 exact (argmax agree 1.000) | ~1.6 ms |
+| `FP4X_DRAFT_INT2=64` | Draft head as INT2 coarse over the 65k draft vocab, then exact NVFP4 rescoring of the top 64; the draft distribution q is those 64 tokens. | draft only (lossless: the rejection sampler uses the same q) | ~0.2 ms; sampled tok/step +3% |
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Removes a post-load dip in MemAvailable, to about 1.5 GiB, that could OOM the box. | – | stability |
 
-Where the time goes now, per 39.4 ms step (CUDA-event spans and graph-timed components at M=3, `x/probes/probe_*.py`):
+Where the time goes now, per 38.8 ms step (CUDA-event spans and graph-timed components at M=3, `x/probes/probe_*.py`):
 
 | Part | ms | Floor at 243 GB/s |
 |---|---|---|
@@ -76,8 +77,8 @@ Where the time goes now, per 39.4 ms step (CUDA-event spans and graph-timed comp
 | ‣ hyper-connection mixers (97 × 2 fused kernels) | ~3.4 | 2.7 |
 | ‣ router gates (W8) | ~0.45 | 0.26 |
 | ‣ GDN / QSA attention, norms, combines, PLE add | ~4.5 | – |
-| 2 draft steps (`propose`) | ~3.0 | |
-| Target LM head (fast head) | ~1.7 | |
+| 2 draft steps (`propose`: draft prefill graph ~1.6, decode graph ~1.2) | ~2.9 | |
+| Target LM head (fast head) | ~1.1 | 1.0 |
 | Disk PLE read gap before the graph | ~0.7 | |
 
 The big kernels already run at 75–90% of DRAM bandwidth; what's left is mostly per-kernel latency in long chains of small launches.
@@ -118,8 +119,14 @@ Greedy prose2 tok/s, ms/step, and tokens per step. Raw JSONL is in `results/`.
 | E26 | + router gates W8 | 52.9 | 40.1 | 2.12 | 70.7 |
 | **E27** | **E26 + fused HC mixers (shipped)** | **54.4** | **39.4** | 2.14 | 71.1 |
 | SHIP2 | shipped `serve.sh` defaults | 55.3 | 39.45 | 2.18 | 71.6 |
+| E28 | E27 with the shared expert on the main stream (`VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`) | 52.8 | 40.6 | 2.14 | 69.2 |
+| E29 | E27 without the GDN input-projection overlap (`VLLM_QWEN3_8_FLASH_NEXT_OVERLAP=0`) | 53.3 | 40.3 | 2.15 | 69.4 |
+| E30 | E27 + W8 + fused mixers on the MTP layer | 55.1 | 39.7 | 2.19 | 71.9 |
+| **E31** | **E27 + fast head at BK 512 + fused refine (shipped)** | **55.0** | **39.0** | 2.14 | 72.9 |
+| **E32** | **E31 + INT2 draft head, top-64 refine (shipped)** | **55.2** | **38.8** | 2.14 | 70.9 |
+| SHIP3 | shipped `serve.sh` defaults | 55.6 | 38.8 | 2.16 | 73.3 |
 
-Sampled prose: E15 47.4, E18 50.8, E20b 48.6, **E21 50.9**, E22 48.8, E24 50.7, E25 50.5, E26 50.8, **E27 51.3**, SHIP2 51.3.
+Sampled prose: E15 47.4, E18 50.8, E20b 48.6, **E21 50.9**, E22 48.8, E24 50.7, E25 50.5, E26 50.8, **E27 51.3**, SHIP2 51.3, E31 52.4, **E32 54.4** (sampled tok/step 2.07 → 2.14), SHIP3 53.4.
 
 Greedy tok/step moves by ±0.03 between identical runs because the drafts are sampled, so ms/step is the cleaner signal for step-cost changes.
 
@@ -136,7 +143,8 @@ Repeated runs of the same config differ by up to ±0.007 (about ±0.25%), becaus
 | + qkvz NV4 (shipped) | 2.6339 |
 | + fast head | 2.6322 |
 | + router gates W8 | 2.6332, 2.6370 |
-| + fused HC mixers (shipped) | 2.6396, 2.6262 |
+| + fused HC mixers | 2.6396, 2.6262 |
+| + fused fast-head refine, INT2 draft head (shipped) | 2.6348 |
 | + qkv NV4 | 2.6438 |
 | out_proj NV4 | 2.7696 |
 | all-dense NV4 | 2.7903 |
@@ -172,7 +180,11 @@ The FP4-Local MTP drafter, LM head and embeddings are **bit-identical** to the p
 - **W6 hyper-connection mixers.** The mixer GEMVs (336×10240, 10240×320) are latency-bound at 17–21 µs; 6-bit weights were no faster than int8 and have 3× the error.
 - **Semaphore split-K for the W6 dense GEMVs.** No gain for any dense shape (out_proj stays near 190 GB/s); split-K only pays off for the 11-tile mixer down projection.
 - **b12x small-M MoE knobs** (`B12X_W4A16_SMALL_M_OCCUPANCY=2`, `B12X_W4A16_SMALL_M_SPLITK=1`): within ±2% on the 48-layer MoE graph. On real routing b12x already reaches ~85–90% of bandwidth, which caps a custom W4A16 decode kernel at roughly 1–1.5 ms.
-- **HC W8 on the MTP mixers** (E24): neutral (−0.1 ms/step).
+- **HC W8 on the MTP mixers** (E24), also with the fused kernels (E30): neutral.
+- **Turning off vLLM's stream overlap.** Running the shared expert on the main stream (E28) costs 1.2 ms/step, and serializing GDN's two input projections (E29) costs 0.9 ms/step. The small decode kernels leave enough of the GPU idle that a second stream fills it, so the defaults stay.
+- **e4m3 group scales for the INT2 head.** 16% fewer bytes, but no faster at M=3 (the dequant becomes the limit).
+- **1-bit (sign × per-16 mean) coarse head.** On 1,200 real decode rows the true argmax ranked as low as 487 and the top-20 often fell outside the top 1024, against a worst rank of 17 for INT2.
+- **Fast-head candidate recall, for the record.** On 1,200–1,500 real decode rows the true argmax was always within the INT2 top 30. The true top 20 was inside the top 512 for all but one row, where one top-20 logit stays a coarse estimate. Greedy output is unaffected; that row's top-k-20 sampling distribution is very slightly off.
 - **Torch profiler.** One profiler run was followed by a hard reset of the Spark on the next reload. Use CUDA-event spans instead (`x/probes/probe16*.py`).
 
 ## Layout

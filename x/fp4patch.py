@@ -229,6 +229,7 @@ def _patch_draft_vocab():
     import fp4x_kernels as F
     path = os.environ["FP4X_DRAFT_VOCAB"]
     cfg = tuple(int(v) for v in os.environ.get("FP4X_DRAFT_CFG", "32,256,4").split(","))
+    dc = int(os.environ.get("FP4X_DRAFT_INT2", "0"))  # >0: INT2 coarse + exact refine of the top dc rows
     orig = MTP.Qwen4ExpMTP.compute_logits
 
     def build(self, dev):
@@ -244,6 +245,10 @@ def _patch_draft_vocab():
         self._fx_gs = float(lm.weight_global_scale.item())
         self._fx_vocab = lm.weight.shape[0]
         _log(f"draft vocab head built: {idx.numel()} ids, {(self._fx_w.numel() + self._fx_s.numel()) / 1e6:.0f} MB")
+        if dc:
+            q = [F.quantize_int2(F.dequant_nv4(self._fx_w[a:a + 8192], self._fx_s[a:a + 8192], self._fx_gs)) for a in range(0, idx.numel(), 8192)]
+            self._fx_c = (torch.cat([t[0] for t in q]), torch.cat([t[1] for t in q]))
+            _log(f"draft head INT2 coarse + exact NVFP4 refine of the top {dc}: {sum(t.numel() * t.element_size() for t in self._fx_c) / 1e6:.0f} MB")
 
     def compute_logits(self, hidden_states, spec_step_idx=0):
         if getattr(self, "_fx_idx", None) is None:
@@ -251,6 +256,13 @@ def _patch_draft_vocab():
                 return orig(self, hidden_states, spec_step_idx)
             build(self, hidden_states.device)
         h = hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous()
+        if dc and h.shape[0] <= 16:
+            # Draft q is restricted to the coarse top-dc rows, scored exactly (lossless: the rejection sampler uses this q).
+            co = F.int2_logits(h, *self._fx_c, self._fx_idx.numel())
+            cand = torch.topk(co, dc, dim=-1).indices
+            vals = F.refine_nv4(h, cand, self._fx_w, self._fx_s, self._fx_gs)
+            full = torch.full((h.shape[0], self._fx_vocab), float("-inf"), dtype=torch.bfloat16, device=h.device)
+            return full.scatter_(1, self._fx_idx[cand], vals.to(torch.bfloat16))
         sub = F.nv4_linear(h, self._fx_w, self._fx_s, self._fx_gs, cfg)
         full = torch.full((h.shape[0], self._fx_vocab), float("-inf"), dtype=sub.dtype, device=sub.device)
         full.index_copy_(1, self._fx_idx, sub)
@@ -300,13 +312,7 @@ def _patch_fast_head():
             P, S, gs = st["coarse"]
             coarse = F.nv4_linear(h, P, S, gs, (32, 256, 4))
         idx = torch.topk(coarse, C, dim=-1).indices  # [M, C]
-        m = h.shape[0]
-        rows = idx.reshape(-1)
-        wr = st["w"].index_select(0, rows).float().view(m * C, -1, 32)
-        sr = torch.exp2(st["s"].index_select(0, rows).float() - 127)[..., None]
-        wd = (wr * sr).view(m, C, -1)
-        exact = torch.einsum("mck,mk->mc", wd, h.float())
-        return coarse.scatter(1, idx, exact.to(coarse.dtype))
+        return F.refine_mx8_(coarse, h, idx, st["w"], st["s"])  # exact MXFP8 rows scattered in place
 
     def compute_logits(self, hidden_states):
         h = hidden_states

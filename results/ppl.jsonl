@@ -29,3 +29,8 @@
 {"tag": "E25_pdl", "tokens": 9588, "ppl": 2.6572}
 {"tag": "E26_gatew8", "tokens": 9588, "ppl": 2.6572}
 {"tag": "E27_hcfused", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E28_noshstream", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E29_nogdnoverlap", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E30_hcw8mtp_fused", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E31_head", "tokens": 9588, "ppl": 2.6572}
+{"tag": "E32_dhead64", "tokens": 9588, "ppl": 2.6572}

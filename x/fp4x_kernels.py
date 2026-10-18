@@ -238,8 +238,9 @@ def quantize_nv4(w, rows=2048):
 
 # --- INT2 coarse head (from E46 exp_head2.py) ---
 @triton.jit
-def _int2_head(X, W, S, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-               XM: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _int2_head(X, W, S, O, RS, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+               XM: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ROW_SCALE: tl.constexpr):
+    # S: per-16 group scales (fp16, or e4m3 relative to the fp32 per-row scale RS when ROW_SCALE)
     pid = tl.program_id(0)
     rn = pid * BN + tl.arange(0, BN)
     rm = tl.arange(0, BM)
@@ -254,36 +255,109 @@ def _int2_head(X, W, S, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
         s = tl.load(S + rn[:, None] * (K // 16) + rg[None, :], (rn[:, None] < N), other=0.0).to(tl.float32)
         w = tl.reshape(tl.reshape(w, (BN, BK // 16, 16)) * s[:, :, None], (BN, BK))
         acc += tl.dot(x, tl.trans(w.to(tl.bfloat16)), out_dtype=tl.float32)
+    if ROW_SCALE:
+        acc = acc * tl.load(RS + rn, rn < N, other=0.0)[None, :]
     tl.store(O + rm[:, None] * N + rn[None, :], acc, (rm[:, None] < M) & (rn[None, :] < N))
 
 # kernel element order within one byte after join/reshape: [b0-1, b4-5, b2-3, b6-7]
 ORDER = (0, 2, 1, 3)   # element j of each 4-group lives in bit-pair ORDER[j]
 
 @torch.no_grad()
-def quantize_int2(weight: torch.Tensor):
+def quantize_int2(weight: torch.Tensor, scale_fmt: str = "fp16"):
+    """INT2 g16 (levels -1.5..1.5 x s). scale_fmt fp16 -> (packed, s); e4m3 -> (packed, s_e4m3, row_scale_fp32)."""
     n, k = weight.shape
     packed = torch.empty((n, k // 4), dtype=torch.uint8, device=weight.device)
-    scales = torch.empty((n, k // 16), dtype=torch.float16, device=weight.device)
+    scales = torch.empty((n, k // 16), dtype=torch.float16 if scale_fmt == "fp16" else torch.float8_e4m3fn, device=weight.device)
+    rows = torch.empty((n,), dtype=torch.float32, device=weight.device)
     for a in range(0, n, 8192):
         f = weight[a:a + 8192].float().view(-1, k // 16, 16)
-        s = (f.abs().amax(-1, keepdim=True).clamp_min(1e-8) / 1.5).half()
-        idx = (torch.floor(f / s.float()) + 2).clamp(0, 3).to(torch.uint8).view(-1, k // 4, 4)
+        s = f.abs().amax(-1, keepdim=True).clamp_min(1e-8) / 1.5
+        if scale_fmt == "fp16":
+            s = s.half(); sf = s.float()
+        else:
+            rs = s.amax(1, keepdim=True) / 448.0
+            s = (s / rs).to(torch.float8_e4m3fn); sf = s.float() * rs
+            rows[a:a + 8192] = rs.view(-1)
+        idx = (torch.floor(f / sf) + 2).clamp(0, 3).to(torch.uint8).view(-1, k // 4, 4)
         b = torch.zeros(idx.shape[:2], dtype=torch.uint8, device=weight.device)
         for j in range(4):
             b |= idx[..., j] << (2 * ORDER[j])
         packed[a:a + 8192] = b; scales[a:a + 8192] = s.squeeze(-1)
-    return packed, scales
+    return (packed, scales) if scale_fmt == "fp16" else (packed, scales, rows)
 
 def dequant_int2(packed, scales):
     n = packed.shape[0]; k = packed.shape[1] * 4
     idx = torch.stack([(packed >> (2 * ORDER[j])) & 3 for j in range(4)], -1).view(n, k).float() - 1.5
     return (idx.view(n, k // 16, 16) * scales.float()[..., None]).view(n, k)
 
-def int2_logits(x, P, S, N, BN=64, BK=256, nw=4):
+def int2_logits(x, P, S, N, BN=64, BK=512, nw=4, RS=None):
     x = x.to(torch.bfloat16).contiguous(); m, k = x.shape
     out = torch.empty((m, N), dtype=torch.float32, device=x.device)
-    _int2_head[(triton.cdiv(N, BN),)](x, P, S, out, m, N, k, x.stride(0), max(16, triton.next_power_of_2(m)), BN, BK, num_warps=nw)
+    _int2_head[(triton.cdiv(N, BN),)](x, P, S, out, out if RS is None else RS, m, N, k, x.stride(0),
+                                      max(16, triton.next_power_of_2(m)), BN, BK, RS is not None, num_warps=nw)
     return out
+
+
+@triton.jit
+def _refine_mx8(X, IDX, W, S, O, C, K: tl.constexpr, V, BC: tl.constexpr, BK: tl.constexpr):
+    # Exact logits for C candidate rows per token from MXFP8 rows (fp8 e4m3 + e8m0 per 32), scattered into O [M, V].
+    m = tl.program_id(0); cb = tl.program_id(1)
+    rc = cb * BC + tl.arange(0, BC)
+    rows = tl.load(IDX + m * C + rc, rc < C, other=0).to(tl.int64)
+    acc = tl.zeros((BC,), tl.float32)
+    for k0 in tl.range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        x = tl.load(X + m * K + rk).to(tl.float32)
+        w = tl.load(W + rows[:, None] * K + rk[None, :], (rc < C)[:, None], other=0.0).to(tl.float32)
+        e = tl.load(S + rows[:, None] * (K // 32) + (k0 // 32 + tl.arange(0, BK // 32))[None, :], (rc < C)[:, None], other=127).to(tl.int32)
+        w = tl.reshape(tl.reshape(w, (BC, BK // 32, 32)) * tl.exp2((e - 127).to(tl.float32))[:, :, None], (BC, BK))
+        acc += tl.sum(w * x[None, :], axis=1)
+    tl.store(O + m * V + rows, acc.to(O.dtype.element_ty), rc < C)
+
+
+def refine_mx8_(out, x, idx, w8, s_u8, BC=16, BK=256, nw=4):
+    """In place: out[m, idx[m, c]] = exact MXFP8 row idx[m, c] . x[m] (fp32 accumulate)."""
+    m, C = idx.shape; K = x.shape[1]
+    _refine_mx8[(m, triton.cdiv(C, BC))](x.contiguous(), idx.contiguous(), w8, s_u8, out, C, K, out.shape[1], BC=BC, BK=BK, num_warps=nw)
+    return out
+
+
+@triton.jit
+def _refine_nv4(X, IDX, W, S, O, gs, C, K: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr):
+    # Exact logits of C candidate rows per token from NVFP4 rows (same decode as _nv4); O: [M, C] fp32.
+    m = tl.program_id(0); cb = tl.program_id(1)
+    rc = cb * BC + tl.arange(0, BC)
+    rows = tl.load(IDX + m * C + rc, rc < C, other=0).to(tl.int64)
+    acc = tl.zeros((BC,), tl.float32)
+    for k0 in tl.range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        x = tl.load(X + m * K + rk).to(tl.float32)
+        q = tl.load(W + rows[:, None] * (K // 2) + (k0 // 2 + tl.arange(0, BK // 2))[None, :], (rc < C)[:, None], other=0).to(tl.int32)
+        qq = tl.reshape(tl.join(q & 0xF, (q >> 4) & 0xF), (BC, BK))
+        e = (qq >> 1) & 3; mt = (qq & 1).to(tl.float32)
+        mag = tl.where(e == 0, mt * 0.5, (1.0 + mt * 0.5) * tl.exp2((e - 1).to(tl.float32)))
+        v = tl.where((qq & 8) != 0, -mag, mag)
+        sc = tl.load(S + rows[:, None] * (K // 16) + (k0 // 16 + tl.arange(0, BK // 16))[None, :], (rc < C)[:, None], other=0.0).to(tl.float32)
+        w = tl.reshape(tl.reshape(v, (BC, BK // 16, 16)) * sc[:, :, None], (BC, BK)).to(tl.bfloat16).to(tl.float32)
+        acc += tl.sum(w * x[None, :], axis=1)
+    tl.store(O + m * C + rc, acc * gs, rc < C)
+
+
+def refine_nv4(x, idx, wp, s, gs, BC=16, BK=256, nw=4):
+    """[M, C] exact NVFP4 logits for candidate rows idx[m, c] (fp32 accumulate)."""
+    m, C = idx.shape; K = x.shape[1]
+    out = torch.empty((m, C), dtype=torch.float32, device=x.device)
+    _refine_nv4[(m, triton.cdiv(C, BC))](x.contiguous(), idx.contiguous(), wp, s, out, gs, C, K, BC=BC, BK=BK, num_warps=nw)
+    return out
+
+
+@torch.no_grad()
+def dequant_nv4(P, S, gs):
+    """[N, K/2] e2m1 pairs + [N, K/16] e4m3 scales -> fp32 [N, K]."""
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], device=P.device)
+    n = P.shape[0]
+    v = torch.stack([lut[(P & 15).long()], lut[(P >> 4).long()]], -1).view(n, -1)
+    return (v.view(n, -1, 16) * S.float()[..., None] * gs).view(n, -1)
 
 
 # --- Fused hyper-connection mixer kernels (decode, M <= 16, W8 weights):

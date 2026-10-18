@@ -10,7 +10,8 @@
 #   FP4X_GATE=w8  MoE router gates as int8 g64 GEMV (decode PPL +0.04%)
 #   FP4X_MTP_W8   MTP layer dense weights int8 g64 (draft only)
 #   FP4X_DRAFT_VOCAB  MTP draft head over a 65k-token NVFP4 subset (draft only)
-#   FP4X_FAST_HEAD    INT2 coarse LM head + exact MXFP8 rescoring of the top 512 (argmax exact)
+#   FP4X_DRAFT_INT2=64 draft head as INT2 coarse + exact NVFP4 refine of the top 64; draft q = those 64 (draft only)
+#   FP4X_FAST_HEAD    INT2 coarse LM head + exact MXFP8 rescoring of the top 512 in one fused kernel (argmax exact)
 #   FP4X_MTP_PATCH    r32a self-distilled drafter weights (t8/build_patch.sh; draft only, +4% prose)
 # Decode-path PPL (12 texts): card 2.6501, optimized ~2.633 (exact MXFP8 more than offsets W6/NV4/W8).
 # usage: serve.sh [port] [extra vllm args...]
@@ -30,7 +31,7 @@ if [ "${FP4_OPT:-1}" = 1 ]; then
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     -e FP4X_MX8=1 -e FP4X_DENSE=w6 -e FP4X_NV4_SHAPES=16384x2560
     -e FP4X_HC=1 -e FP4X_HC_W8=1 -e FP4X_HC_FUSED=1 -e FP4X_MTP_W8=1 -e FP4X_GATE=w8
-    -e FP4X_DRAFT_VOCAB=/opt/fp4x/dv65k.txt -e FP4X_FAST_HEAD=1
+    -e FP4X_DRAFT_VOCAB=/opt/fp4x/dv65k.txt -e FP4X_DRAFT_INT2=64 -e FP4X_FAST_HEAD=1
   )
   if [ -f $X/mtp_patch_r32a.safetensors ]; then
     OPT_ARGS+=(-v $X/mtp_patch_r32a.safetensors:/opt/fp4x/mtp_patch_r32a.safetensors:ro -e FP4X_MTP_PATCH=/opt/fp4x/mtp_patch_r32a.safetensors)
